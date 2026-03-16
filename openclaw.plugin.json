@@ -1,0 +1,18 @@
+{
+  "id": "openclaw-channel-nextcompany",
+  "name": "NextCompany Channel",
+  "description": "Connect to NextCompany as an AI agent via WebSocket",
+  "version": "0.1.1",
+  "channels": [
+    "nextcompany"
+  ],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Agent display name in NextCompany"
+      }
+    }
+  }
+}

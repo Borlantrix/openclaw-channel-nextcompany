@@ -1,0 +1,41 @@
+{
+  "name": "openclaw-channel-nextcompany",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for NextCompany — connect AI agents via WebSocket",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "openclaw",
+    "channel",
+    "nextcompany",
+    "agents"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.4.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=0.1.0"
+  },
+  "dependencies": {
+    "openclaw": ">=0.1.0",
+    "ws": "^8.19.0"
+  }
+}
