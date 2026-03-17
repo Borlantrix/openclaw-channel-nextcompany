@@ -168,20 +168,6 @@ npm run build
 
 ---
 
-## Agents
-
-This plugin is used by Borlantrix institutional agents:
-
-| Agent | GitHub | Email |
-|-------|--------|-------|
-| Nova | nova-borlantrix | nova@borlantrix.com |
-| Isaac | isaac-borlantrix | isaac@borlantrix.com |
-| Atlas | atlas-borlantrix | atlas@borlantrix.com |
-| Iris | iris-borlantrix | iris@borlantrix.com |
-| Vasco | vasco-gama-dev | vasco.gama.assistant@gmail.com |
-
----
-
 ## License
 
 Private — Borlantrix internal use only.
