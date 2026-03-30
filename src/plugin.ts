@@ -1,5 +1,8 @@
+import { createRequire } from 'module';
 import { NextCompanyWebSocketClient } from './websocket.js';
 import { type NextCompanyAccountConfig, type InboundMessage } from './types.js';
+
+const _require = createRequire(import.meta.url);
 
 // Minimal ChannelPlugin shape — matches openclaw ChannelPlugin interface
 // Full types available when openclaw is installed as peer dependency
@@ -65,6 +68,49 @@ export const plugin = {
             text: msg.text,
             messageId: msg.messageId,
             timestamp: msg.timestamp,
+          });
+          return;
+        }
+
+        if (msg.type === 'model_query') {
+          // Respond with the current model from OpenClaw config
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const fs = _require('fs');
+            const path = _require('path');
+            const home = process.env.HOME ?? process.env.USERPROFILE ?? '';
+            const configPath = path.join(home, '.openclaw', 'openclaw.json');
+            const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+            const model = config?.agents?.defaults?.model?.primary ?? 'unknown';
+            client.send({ type: 'model_response', model });
+          } catch {
+            client.send({ type: 'model_response', model: 'unknown' });
+          }
+          return;
+        }
+
+        if (msg.type === 'check_in') {
+          dispatch({
+            channel: 'nextcompany',
+            accountId,
+            chatId: `nextcompany:${accountId}:checkin:${msg.checkInId}`,
+            senderId: 'system',
+            senderName: 'NextCompany Check-in',
+            text: `[NextCompany Check-in] ${msg.question}${msg.description ? `\n${msg.description}` : ''}\n\nOccurrence: ${msg.occurrenceId}\nProject: ${msg.projectId}`,
+            timestamp: msg.scheduledAt,
+          });
+          return;
+        }
+
+        if (msg.type === 'mailbox_email') {
+          dispatch({
+            channel: 'nextcompany',
+            accountId,
+            chatId: `nextcompany:${accountId}:mailbox:${msg.messageId}`,
+            senderId: msg.from,
+            senderName: msg.fromName ?? msg.from,
+            text: `[NextCompany Mailbox] New email from ${msg.fromName ?? msg.from}\nSubject: ${msg.subject}\n\n${msg.bodyText ?? msg.snippet ?? ''}\n\nMessage ID: ${msg.messageId}`,
+            timestamp: msg.receivedAt,
           });
           return;
         }
