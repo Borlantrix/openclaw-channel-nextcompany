@@ -1,5 +1,5 @@
 import type { OpenClawConfig, OpenClawPluginApi, ChannelPlugin } from 'openclaw/plugin-sdk';
-import { createAccountListHelpers } from 'openclaw/plugin-sdk';
+import { createAccountListHelpers } from 'openclaw/plugin-sdk/account-helpers';
 import { NextCompanyWebSocketClient } from './websocket.js';
 import type { NextCompanyAccountConfig, InboundMessage } from './types.js';
 import { execSync } from 'child_process';
