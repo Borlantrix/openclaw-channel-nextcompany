@@ -131,6 +131,15 @@ function buildIdentifyPayload(cfg: OpenClawConfig): Record<string, unknown> {
     cronJobs.push({ name: 'Heartbeat', schedule: String(heartbeat['interval'] ?? '5m'), enabled: heartbeat['enabled'] !== false, type: 'heartbeat' });
   }
 
+  // Read active model from config
+  let activeModel: string | undefined;
+  try {
+    const agentsSection = cfgAny['agents'] as Record<string, unknown> | undefined;
+    const defaults = agentsSection?.['defaults'] as Record<string, unknown> | undefined;
+    const modelSection = defaults?.['model'] as Record<string, unknown> | undefined;
+    activeModel = modelSection?.['primary'] as string | undefined;
+  } catch { /* ignore */ }
+
   return {
     version,
     latestVersion,
@@ -139,6 +148,7 @@ function buildIdentifyPayload(cfg: OpenClawConfig): Record<string, unknown> {
     gitHubUsername,
     cronJobs,
     tools: { channels, clis, plugins, skills },
+    ...(activeModel ? { model: activeModel } : {}),
   };
 }
 
