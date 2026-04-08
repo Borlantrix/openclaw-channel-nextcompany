@@ -2,13 +2,13 @@
 
 **AI agents via WebSocket integration with NextCompany**
 
-This OpenClaw channel plugin enables AI agents to connect to [NextCompany](https://nextcompany.app) via WebSocket and receive real-time notifications for:
+This OpenClaw channel plugin enables AI agents to connect to [NextCompany](https://nextcompany.app) via WebSocket and receive real-time work events for:
 
 - 📌 **Assignments** — Cards/Tasks assigned to the agent
 - 💬 **Mentions** — @mentions in comments
 - 📝 **Comments** — New comments on subscribed items
 - 📰 **Posts** — New posts published
-- 🔔 **Custom notifications** — Extensible notification system
+- 🔔 **Custom notifications** — Routed onto stable work-item sessions
 
 ---
 
@@ -16,10 +16,10 @@ This OpenClaw channel plugin enables AI agents to connect to [NextCompany](https
 
 ✅ **Real-time WebSocket connection** to NextCompany backend  
 ✅ **Automatic reconnection** with exponential backoff  
-✅ **Flattened payload support** — handles backend's flat notification structure  
-✅ **Kind-aware notifications** — Assigned, Mention, NewPost, Comment  
-✅ **Auto-dispatch to active session** — Notifications delivered to Telegram/active channel  
-✅ **API-ready responses** — Includes curl commands for direct API interaction  
+✅ **Structured inbound routing** — notification payloads are parsed into work-item context  
+✅ **Entity-based sessions** — cards, posts, tasks, check-ins, and mailbox threads keep stable identities  
+✅ **Prompt-safe inbound context** — no curl instructions, API keys, or transport meta in agent text  
+✅ **Single gateway path** — one maintained plugin entrypoint for inbound handling and outbound delivery  
 
 ---
 
@@ -100,13 +100,12 @@ OpenClaw Session
 Telegram / Active Channel
 ```
 
-### Notification Flow
+### Inbound Flow
 
-1. **Backend sends notification** via WebSocket (flattened payload)
-2. **Plugin receives** and parses `type: "notification"`
-3. **Kind-aware formatting** based on `kind` field (Assigned, Mention, etc.)
-4. **Dispatch to session** with API instructions (curl commands)
-5. **Agent responds** using `exec` tool with direct API calls
+1. **Backend sends an inbound event** via WebSocket.
+2. **The plugin resolves the real work entity** (`card`, `post`, `task`, `checkin`, `mailbox`) and builds a deterministic session key from that entity.
+3. **Structured context is attached** to the OpenClaw inbound payload using clean body text plus metadata fields such as `tableId`, `commentId`, and `triggerKind` when available.
+4. **Replies are dispatched through the gateway path** and sent back over the active NextCompany WebSocket connection.
 
 ---
 
@@ -123,10 +122,9 @@ npm run build
 ```
 openclaw-channel-nextcompany/
 ├── src/
-│   ├── index.ts          # Main plugin entry (OpenClaw integration)
-│   ├── plugin.ts         # Lightweight plugin (standalone)
+│   ├── index.ts          # Main plugin entry and inbound router
 │   ├── websocket.ts      # WebSocket client with reconnection
-│   └── types.ts          # TypeScript types for messages
+│   └── types.ts          # Protocol and notification metadata types
 ├── dist/                 # Compiled JavaScript (generated)
 ├── package.json
 ├── tsconfig.json
@@ -135,9 +133,9 @@ openclaw-channel-nextcompany/
 
 ### Key Concepts
 
-- **Flattened Payload:** Backend sends notifications with fields directly on the root object (`msg.kind`, `msg.sourceType`), not nested in `msg.payload`.
-- **Kind-Aware:** Plugin formats messages differently based on `kind` (Assigned, Mention, NewPost, Comment).
-- **Dual Entry:** `index.ts` for full OpenClaw integration, `plugin.ts` for minimal standalone mode.
+- **Structured Notification Metadata:** Notification payloads may carry `tableId`, `commentId`, `triggerKind`, and related entity metadata.
+- **Stable Entity Routing:** Session identity is derived from the underlying work entity, not the notification id.
+- **Single Entry:** `index.ts` is the maintained plugin implementation.
 
 ---
 

@@ -1,25 +1,61 @@
-import type { OpenClawConfig, OpenClawPluginApi, ChannelPlugin } from 'openclaw/plugin-sdk';
-import { createAccountListHelpers } from 'openclaw/plugin-sdk';
-import { NextCompanyWebSocketClient } from './websocket.js';
-import type { NextCompanyAccountConfig, InboundMessage } from './types.js';
 import { execSync } from 'child_process';
-import { readdirSync, readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { existsSync, readdirSync, readFileSync } from 'fs';
 import { homedir } from 'os';
+import { join } from 'path';
+import type { ChannelPlugin, OpenClawConfig, OpenClawPluginApi } from 'openclaw/plugin-sdk';
+import { createAccountListHelpers } from 'openclaw/plugin-sdk';
+import type {
+  InboundMessage,
+  NextCompanyAccountConfig,
+  NextCompanyCheckInMessage,
+  NextCompanyDirectMessage,
+  NextCompanyMailboxEmailMessage,
+  NextCompanyNotificationMessage,
+  NextCompanyNotificationMetadata,
+} from './types.js';
+import { NextCompanyWebSocketClient } from './websocket.js';
 
-const connections = new Map<string, NextCompanyWebSocketClient>();
+const CHANNEL_ID = 'nextcompany';
+const CHANNEL_LABEL = 'NextCompany';
+const connections = new Map<string, { client: NextCompanyWebSocketClient; startedAt: number }>();
 
-const { listAccountIds, resolveDefaultAccountId } = createAccountListHelpers('nextcompany');
+const { listAccountIds, resolveDefaultAccountId } = createAccountListHelpers(CHANNEL_ID);
+type StartAccountContext = Parameters<
+  NonNullable<NonNullable<ChannelPlugin<NextCompanyAccountConfig>['gateway']>['startAccount']>
+>[0];
+type ChannelRuntime = NonNullable<StartAccountContext['channelRuntime']>;
+
+interface RoutedInboundContext {
+  rawBody: string;
+  from: string;
+  fromLabel: string;
+  to: string;
+  peerId: string;
+  conversationLabel: string;
+  timestamp?: number;
+  messageSid?: string;
+  replyToId?: string;
+  senderName?: string;
+  senderId?: string;
+  senderUsername?: string;
+  untrustedContext?: string[];
+}
 
 function getAccounts(cfg: OpenClawConfig): Record<string, NextCompanyAccountConfig> {
   const ch = (cfg as Record<string, unknown>)['channels'] as Record<string, unknown> | undefined;
-  const nc = ch?.['nextcompany'] as Record<string, unknown> | undefined;
+  const nc = ch?.[CHANNEL_ID] as Record<string, unknown> | undefined;
   const accounts = nc?.['accounts'] as Record<string, unknown> | undefined;
   if (!accounts) return {};
+
   const result: Record<string, NextCompanyAccountConfig> = {};
-  for (const [id, v] of Object.entries(accounts)) {
-    const a = v as Record<string, unknown>;
-    result[id] = { id, apiKey: String(a['apiKey'] ?? ''), url: String(a['url'] ?? ''), name: a['name'] ? String(a['name']) : undefined };
+  for (const [id, value] of Object.entries(accounts)) {
+    const account = value as Record<string, unknown>;
+    result[id] = {
+      id,
+      apiKey: String(account['apiKey'] ?? ''),
+      url: String(account['url'] ?? ''),
+      name: account['name'] ? String(account['name']) : undefined,
+    };
   }
   return result;
 }
@@ -31,44 +67,56 @@ function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): NextCom
 }
 
 function getOpenClawVersion(): string | undefined {
-  try { return execSync('openclaw --version 2>/dev/null', { timeout: 5000 }).toString().trim(); } catch { return undefined; }
+  try {
+    return execSync('openclaw --version 2>/dev/null', { timeout: 5000 }).toString().trim();
+  } catch {
+    return undefined;
+  }
 }
 
 function getLatestOpenClawVersion(): string | undefined {
-  try { return execSync('npm view openclaw version 2>/dev/null', { timeout: 10000 }).toString().trim(); } catch { return undefined; }
+  try {
+    return execSync('npm view openclaw version 2>/dev/null', { timeout: 10000 }).toString().trim();
+  } catch {
+    return undefined;
+  }
 }
 
 function getWorkspaceFiles(): string[] {
   const wsDir = join(homedir(), '.openclaw', 'workspace');
   if (!existsSync(wsDir)) return [];
+
   const files: string[] = [];
   try {
-    // Root .md files
-    for (const f of readdirSync(wsDir)) {
-      if (f.endsWith('.md')) files.push(f);
+    for (const file of readdirSync(wsDir)) {
+      if (file.endsWith('.md')) files.push(file);
     }
-    // memory/ and docs/ — .md only
     for (const subdir of ['memory', 'docs']) {
       const dir = join(wsDir, subdir);
-      if (existsSync(dir)) {
-        for (const f of readdirSync(dir)) {
-          if (f.endsWith('.md')) files.push(`${subdir}/${f}`);
-        }
+      if (!existsSync(dir)) continue;
+      for (const file of readdirSync(dir)) {
+        if (file.endsWith('.md')) files.push(`${subdir}/${file}`);
       }
     }
-    // downloads/ — all files (images, PDFs, etc.)
     const downloadsDir = join(wsDir, 'downloads');
     if (existsSync(downloadsDir)) {
-      for (const f of readdirSync(downloadsDir)) {
-        files.push(`downloads/${f}`);
+      for (const file of readdirSync(downloadsDir)) {
+        files.push(`downloads/${file}`);
       }
     }
-  } catch { /* ignore */ }
+  } catch {
+    return files;
+  }
+
   return files;
 }
 
 function readWorkspaceFile(path: string): string | undefined {
-  try { return readFileSync(path, 'utf-8'); } catch { return undefined; }
+  try {
+    return readFileSync(path, 'utf-8');
+  } catch {
+    return undefined;
+  }
 }
 
 function extractField(content: string, field: string): string | undefined {
@@ -82,7 +130,6 @@ function buildIdentifyPayload(cfg: OpenClawConfig): Record<string, unknown> {
   const latestVersion = getLatestOpenClawVersion();
   const workspaceFiles = getWorkspaceFiles();
 
-  // Read email and GitHub from IDENTITY.md and TOOLS.md
   const wsDir = join(homedir(), '.openclaw', 'workspace');
   let email: string | undefined;
   let gitHubUsername: string | undefined;
@@ -93,6 +140,7 @@ function buildIdentifyPayload(cfg: OpenClawConfig): Record<string, unknown> {
     email = extractField(content, 'Email');
     gitHubUsername = extractField(content, 'GitHub Team') ?? extractField(content, 'GitHub');
   }
+
   const toolsPath = join(wsDir, 'TOOLS.md');
   if (existsSync(toolsPath)) {
     const content = readWorkspaceFile(toolsPath) ?? '';
@@ -100,45 +148,48 @@ function buildIdentifyPayload(cfg: OpenClawConfig): Record<string, unknown> {
     if (!email) email = extractField(content, 'Email');
   }
 
-  // Read tools from OpenClaw config
   const channels: { name: string; enabled: boolean }[] = [];
   const clis: { name: string; label: string; version: string }[] = [];
   const plugins: { name: string; enabled: boolean }[] = [];
   const skills: { name: string; source: string; description: string; enabled: boolean }[] = [];
+  const cronJobs: { name: string; schedule: string; enabled: boolean; type: string }[] = [];
 
   const cfgAny = cfg as Record<string, unknown>;
-  // Channels
-  const chSection = cfgAny['channels'] as Record<string, unknown> | undefined;
-  if (chSection) {
-    for (const [name, v] of Object.entries(chSection)) {
-      const ch = v as Record<string, unknown>;
-      channels.push({ name, enabled: ch['enabled'] !== false });
-    }
-  }
-  // Plugins
-  const plSection = (cfgAny['plugins'] as Record<string, unknown>)?.['entries'] as Record<string, unknown> | undefined;
-  if (plSection) {
-    for (const [name, v] of Object.entries(plSection)) {
-      const pl = v as Record<string, unknown>;
-      plugins.push({ name, enabled: pl['enabled'] !== false });
+  const channelSection = cfgAny['channels'] as Record<string, unknown> | undefined;
+  if (channelSection) {
+    for (const [name, value] of Object.entries(channelSection)) {
+      const channel = value as Record<string, unknown>;
+      channels.push({ name, enabled: channel['enabled'] !== false });
     }
   }
 
-  // Cron jobs
-  const cronJobs: { name: string; schedule: string; enabled: boolean; type: string }[] = [];
+  const pluginSection = (cfgAny['plugins'] as Record<string, unknown>)?.['entries'] as Record<string, unknown> | undefined;
+  if (pluginSection) {
+    for (const [name, value] of Object.entries(pluginSection)) {
+      const plugin = value as Record<string, unknown>;
+      plugins.push({ name, enabled: plugin['enabled'] !== false });
+    }
+  }
+
   const heartbeat = cfgAny['heartbeat'] as Record<string, unknown> | undefined;
   if (heartbeat) {
-    cronJobs.push({ name: 'Heartbeat', schedule: String(heartbeat['interval'] ?? '5m'), enabled: heartbeat['enabled'] !== false, type: 'heartbeat' });
+    cronJobs.push({
+      name: 'Heartbeat',
+      schedule: String(heartbeat['interval'] ?? '5m'),
+      enabled: heartbeat['enabled'] !== false,
+      type: 'heartbeat',
+    });
   }
 
-  // Read active model from config
   let activeModel: string | undefined;
   try {
     const agentsSection = cfgAny['agents'] as Record<string, unknown> | undefined;
     const defaults = agentsSection?.['defaults'] as Record<string, unknown> | undefined;
     const modelSection = defaults?.['model'] as Record<string, unknown> | undefined;
     activeModel = modelSection?.['primary'] as string | undefined;
-  } catch { /* ignore */ }
+  } catch {
+    activeModel = undefined;
+  }
 
   return {
     version,
@@ -152,11 +203,352 @@ function buildIdentifyPayload(cfg: OpenClawConfig): Record<string, unknown> {
   };
 }
 
+function normalizeBaseUrl(url: string): string {
+  return url
+    .replace(/^wss:\/\//, 'https://')
+    .replace(/^ws:\/\//, 'http://')
+    .replace(/\/ws\/agents\/?$/, '');
+}
+
+function normalizeToken(value: string | undefined, fallback = 'unknown'): string {
+  const normalized = (value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._:-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || fallback;
+}
+
+function normalizeLabel(value: string | undefined, fallback: string): string {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : fallback;
+}
+
+function toTimestamp(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function joinContextLines(lines: Array<string | undefined>): string[] {
+  return lines
+    .map((line) => line?.trim())
+    .filter((line): line is string => Boolean(line));
+}
+
+function formatNotificationSummary(message: NextCompanyNotificationMessage): string {
+  const sourceType = normalizeLabel(message.sourceType, 'work item');
+  const title = normalizeLabel(message.sourceTitle, 'Untitled');
+  const actor = message.actorName?.trim();
+
+  switch (message.kind) {
+    case 'Assigned':
+      return actor
+        ? `${actor} assigned you to ${sourceType} "${title}".`
+        : `You were assigned to ${sourceType} "${title}".`;
+    case 'Mention':
+      return actor
+        ? `${actor} mentioned you in ${sourceType} "${title}".`
+        : `You were mentioned in ${sourceType} "${title}".`;
+    case 'NewPost':
+      return actor
+        ? `${actor} published a new post "${title}".`
+        : `New post "${title}".`;
+    case 'Comment':
+      return actor
+        ? `${actor} commented on ${sourceType} "${title}".`
+        : `New comment on ${sourceType} "${title}".`;
+    default:
+      return actor
+        ? `${actor} triggered ${message.kind} on ${sourceType} "${title}".`
+        : `${message.kind} on ${sourceType} "${title}".`;
+  }
+}
+
+function resolveNotificationMetadata(message: NextCompanyNotificationMessage): NextCompanyNotificationMetadata {
+  return {
+    ...(message.metadata ?? {}),
+    tableId: message.tableId ?? message.metadata?.tableId,
+    commentId: message.commentId ?? message.metadata?.commentId,
+    triggerKind: message.triggerKind ?? message.metadata?.triggerKind,
+  };
+}
+
+function resolveNotificationEntityUrl(params: {
+  baseUrl: string;
+  message: NextCompanyNotificationMessage;
+  metadata: NextCompanyNotificationMetadata;
+}): string | undefined {
+  const { baseUrl, message, metadata } = params;
+  if (message.actionUrl?.trim()) {
+    if (/^https?:\/\//i.test(message.actionUrl)) return message.actionUrl;
+    return `${baseUrl}${message.actionUrl.startsWith('/') ? '' : '/'}${message.actionUrl}`;
+  }
+
+  switch (normalizeToken(message.sourceType)) {
+    case 'card':
+      if (message.projectId && metadata.tableId) {
+        return `${baseUrl}/projects/${message.projectId}/boards/${metadata.tableId}/cards/${message.sourceId}`;
+      }
+      return undefined;
+    case 'task':
+      return `${baseUrl}/projects/${message.projectId}/tasks/${message.sourceId}`;
+    case 'post':
+      return `${baseUrl}/projects/${message.projectId}/posts/${message.sourceId}`;
+    default:
+      return undefined;
+  }
+}
+
+function buildNotificationContext(message: NextCompanyNotificationMessage, baseUrl: string): RoutedInboundContext {
+  const metadata = resolveNotificationMetadata(message);
+  const entityType = normalizeToken(metadata.entityKind ?? message.sourceType, 'notification');
+  const entityId = normalizeToken(metadata.entityId ?? message.sourceId ?? message.id, 'unknown');
+  const projectId = normalizeToken(message.projectId, 'project');
+  const peerId = `${entityType}:${projectId}:${entityId}`;
+  const actionUrl = resolveNotificationEntityUrl({ baseUrl, message, metadata });
+  const rawBody = [
+    formatNotificationSummary(message),
+    message.excerpt?.trim() ? `Excerpt:\n${message.excerpt.trim()}` : undefined,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n\n');
+
+  return {
+    rawBody,
+    from: message.actorName?.trim()
+      ? `nextcompany:actor:${normalizeToken(message.actorName)}`
+      : 'nextcompany:system',
+    fromLabel: normalizeLabel(message.actorName, CHANNEL_LABEL),
+    to: `nextcompany:${peerId}`,
+    peerId,
+    conversationLabel: `${normalizeLabel(message.sourceType, 'Work')}: ${normalizeLabel(message.sourceTitle, 'Untitled')}`,
+    timestamp: toTimestamp(message.createdAt),
+    messageSid: metadata.commentId ?? message.id,
+    replyToId: metadata.commentId ?? message.id,
+    senderName: normalizeLabel(message.actorName, CHANNEL_LABEL),
+    senderId: message.actorName?.trim() ? normalizeToken(message.actorName) : 'system',
+    untrustedContext: joinContextLines([
+      `Notification kind: ${message.kind}`,
+      metadata.triggerKind ? `Trigger kind: ${metadata.triggerKind}` : undefined,
+      `Entity type: ${normalizeLabel(message.sourceType, 'unknown')}`,
+      `Entity id: ${message.sourceId}`,
+      message.projectName ? `Project: ${message.projectName}` : `Project id: ${message.projectId}`,
+      metadata.tableId ? `Table id: ${metadata.tableId}` : undefined,
+      metadata.commentId ? `Comment id: ${metadata.commentId}` : undefined,
+      actionUrl ? `Open in NextCompany: ${actionUrl}` : undefined,
+    ]),
+  };
+}
+
+function buildMessageContext(message: NextCompanyDirectMessage): RoutedInboundContext {
+  const senderId = normalizeToken(message.fromUserId ?? message.from ?? message.channelId, 'system');
+  const senderName = normalizeLabel(message.fromName ?? message.senderName ?? message.from, 'NextCompany');
+  const attachmentLine = message.attachmentUrl
+    ? `Attachment: ${message.attachmentFileName ?? message.attachmentUrl}`
+    : undefined;
+
+  return {
+    rawBody: joinContextLines([message.text, attachmentLine]).join('\n\n'),
+    from: `nextcompany:user:${senderId}`,
+    fromLabel: senderName,
+    to: `nextcompany:direct:${senderId}`,
+    peerId: `direct:${senderId}`,
+    conversationLabel: senderName,
+    timestamp: toTimestamp(message.timestamp),
+    messageSid: message.messageId,
+    replyToId: message.messageId,
+    senderName,
+    senderId,
+    senderUsername: message.from,
+    untrustedContext: joinContextLines([
+      message.channelId ? `Channel id: ${message.channelId}` : undefined,
+      message.attachmentUrl ? `Attachment URL: ${message.attachmentUrl}` : undefined,
+      message.attachmentContentType ? `Attachment content type: ${message.attachmentContentType}` : undefined,
+    ]),
+  };
+}
+
+function buildCheckInContext(message: NextCompanyCheckInMessage): RoutedInboundContext {
+  const peerId = `checkin:${normalizeToken(message.projectId)}:${normalizeToken(message.checkInId)}`;
+  const rawBody = [
+    `Check-in question: ${message.question.trim()}`,
+    message.description?.trim() ? `Details:\n${message.description.trim()}` : undefined,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n\n');
+
+  return {
+    rawBody,
+    from: 'nextcompany:system:checkin',
+    fromLabel: 'NextCompany Check-in',
+    to: `nextcompany:${peerId}`,
+    peerId,
+    conversationLabel: `Check-in ${message.checkInId}`,
+    timestamp: toTimestamp(message.scheduledAt),
+    messageSid: message.occurrenceId,
+    replyToId: message.occurrenceId,
+    senderName: 'NextCompany Check-in',
+    senderId: 'checkin',
+    untrustedContext: joinContextLines([
+      `Project id: ${message.projectId}`,
+      `Check-in id: ${message.checkInId}`,
+      `Occurrence id: ${message.occurrenceId}`,
+    ]),
+  };
+}
+
+function buildMailboxContext(message: NextCompanyMailboxEmailMessage): RoutedInboundContext {
+  const mailboxScope = normalizeToken(
+    message.threadId ?? message.conversationId ?? message.messageId,
+    normalizeToken(message.messageId),
+  );
+  const peerId = `mailbox:${normalizeToken(message.accountId)}:${mailboxScope}`;
+  const preview = message.bodyText?.trim() || message.snippet?.trim();
+  const rawBody = [
+    `Email from ${normalizeLabel(message.fromName, message.from)}`,
+    `Subject: ${message.subject.trim()}`,
+    preview ? `Preview:\n${preview}` : undefined,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n\n');
+
+  return {
+    rawBody,
+    from: `nextcompany:mailbox:${normalizeToken(message.from)}`,
+    fromLabel: normalizeLabel(message.fromName, message.from),
+    to: `nextcompany:${peerId}`,
+    peerId,
+    conversationLabel: `Mailbox: ${message.subject.trim() || message.messageId}`,
+    timestamp: toTimestamp(message.receivedAt),
+    messageSid: message.messageId,
+    replyToId: message.messageId,
+    senderName: normalizeLabel(message.fromName, message.from),
+    senderId: normalizeToken(message.from),
+    senderUsername: message.from,
+    untrustedContext: joinContextLines([
+      `Mailbox account id: ${message.accountId}`,
+      message.mailboxId ? `Mailbox id: ${message.mailboxId}` : undefined,
+      message.threadId ? `Thread id: ${message.threadId}` : undefined,
+      message.conversationId ? `Conversation id: ${message.conversationId}` : undefined,
+      `Message id: ${message.messageId}`,
+    ]),
+  };
+}
+
+async function dispatchInboundContext(params: {
+  cfg: OpenClawConfig;
+  accountId: string;
+  inbound: RoutedInboundContext;
+  channelRuntime: ChannelRuntime;
+  client: NextCompanyWebSocketClient;
+}): Promise<void> {
+  const { cfg, accountId, inbound, channelRuntime, client } = params;
+  const route = channelRuntime.routing.resolveAgentRoute({
+    cfg,
+    channel: CHANNEL_ID,
+    accountId,
+    peer: {
+      kind: 'direct',
+      id: inbound.peerId,
+    },
+  });
+
+  const storePath = channelRuntime.session.resolveStorePath(cfg.session?.store, {
+    agentId: route.agentId,
+  });
+  const previousTimestamp = channelRuntime.session.readSessionUpdatedAt({
+    storePath,
+    sessionKey: route.sessionKey,
+  });
+  const envelope = channelRuntime.reply.resolveEnvelopeFormatOptions(cfg);
+  const body = channelRuntime.reply.formatAgentEnvelope({
+    channel: CHANNEL_LABEL,
+    from: inbound.fromLabel,
+    timestamp: inbound.timestamp,
+    previousTimestamp,
+    envelope,
+    body: inbound.rawBody,
+  });
+
+  const ctxPayload = channelRuntime.reply.finalizeInboundContext({
+    Body: body,
+    BodyForAgent: inbound.rawBody,
+    RawBody: inbound.rawBody,
+    CommandBody: inbound.rawBody,
+    From: inbound.from,
+    To: inbound.to,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: 'direct',
+    ConversationLabel: inbound.conversationLabel,
+    SenderName: inbound.senderName,
+    SenderId: inbound.senderId,
+    SenderUsername: inbound.senderUsername,
+    Timestamp: inbound.timestamp,
+    MessageSid: inbound.messageSid,
+    MessageSidFull: inbound.messageSid,
+    ReplyToId: inbound.replyToId,
+    ReplyToIdFull: inbound.replyToId,
+    Provider: CHANNEL_ID,
+    Surface: CHANNEL_ID,
+    OriginatingChannel: CHANNEL_ID,
+    OriginatingTo: inbound.to,
+    ExplicitDeliverRoute: true,
+    UntrustedContext: inbound.untrustedContext,
+  });
+
+  await channelRuntime.session.recordInboundSession({
+    storePath,
+    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+    ctx: ctxPayload,
+    onRecordError: (err) => {
+      console.error('[NC] failed updating session metadata', err);
+    },
+  });
+
+  await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg,
+    dispatcherOptions: {
+      deliver: async (payload) => {
+        const text = typeof payload === 'string'
+          ? payload
+          : (payload as { text?: string; replyToId?: string }).text ?? '';
+        if (!text.trim()) return;
+        client.send({
+          type: 'message',
+          text,
+          replyToMessageId: inbound.replyToId,
+        });
+      },
+      onError: (err, info) => {
+        console.error(`[NC] ${info.kind} reply failed`, err);
+      },
+    },
+  });
+}
+
+function resolveInboundContext(message: InboundMessage, account: NextCompanyAccountConfig): RoutedInboundContext | undefined {
+  switch (message.type) {
+    case 'message':
+      return buildMessageContext(message);
+    case 'notification':
+      return buildNotificationContext(message, normalizeBaseUrl(account.url));
+    case 'check_in':
+      return buildCheckInContext(message);
+    case 'mailbox_email':
+      return buildMailboxContext(message);
+    default:
+      return undefined;
+  }
+}
+
 const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
-  id: 'nextcompany',
+  id: CHANNEL_ID,
 
   meta: {
-    id: 'nextcompany',
+    id: CHANNEL_ID,
     label: 'NextCompany',
     selectionLabel: 'NextCompany',
     detailLabel: 'NextCompany Agent Channel',
@@ -174,230 +566,130 @@ const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
     describeAccount: (account: NextCompanyAccountConfig) => ({
       accountId: account.id,
       name: `NextCompany (${account.id})`,
-      connected: connections.get(account.id)?.isConnected ?? false,
+      connected: connections.get(account.id)?.client.isConnected ?? false,
     }),
   },
 
   gateway: {
     startAccount: async (ctx) => {
-      const { accountId, account, cfg } = ctx;
-      console.log("[NC] startAccount called for", accountId, "url:", account.url);
-      const channelRuntime = ctx.channelRuntime;
+      const { accountId, account, cfg, channelRuntime } = ctx;
+      console.log('[NC] startAccount', accountId, account.url);
 
-      const onMessage = async (msg: InboundMessage) => {
-        // Handle file read requests from the backend
-        if (msg.type === 'readFile') {
+      let lastMessageAt = Date.now();
+      let avatarLoopTimer: ReturnType<typeof setTimeout> | null = null;
+      let isAvatarLoopActive = false;
+
+      const handleInboundMessage = async (message: InboundMessage) => {
+        lastMessageAt = Date.now();
+        const entry = connections.get(accountId);
+        const client = entry?.client;
+        if (!client) return;
+
+        if (message.type === 'readFile') {
           const wsDir = join(homedir(), '.openclaw', 'workspace');
-          const filePath = join(wsDir, msg.file);
+          const filePath = join(wsDir, message.file);
           const content = readWorkspaceFile(filePath);
-          const client = connections.get(accountId);
-          client?.send({
+          client.send({
             type: 'fileContent',
-            requestId: msg.requestId,
+            requestId: message.requestId,
             content: content ?? null,
             error: content === undefined ? 'File not found' : null,
           });
           return;
         }
 
-        if (msg.type === 'notification') {
-          if (!channelRuntime) return;
-          // Backend now sends flattened payload (fields directly on msg)
-          const p = msg;
-          const baseUrl = account.url.replace('/ws/agents', '').replace('wss://', 'https://');
-          const apiKey = account.apiKey;
-
-          // Build notification text based on kind
-          let notifText: string;
-          if (p.kind === 'Assigned') {
-            notifText = `[NextCompany] You were assigned to ${p.sourceType}: "${p.sourceTitle}"`;
-            if (p.actorName) notifText += ` by ${p.actorName}`;
-            notifText += `.`;
-          } else if (p.kind === 'Mention') {
-            notifText = `[NextCompany] You were mentioned in ${p.sourceType}: "${p.sourceTitle}"`;
-            if (p.actorName) notifText += ` by ${p.actorName}`;
-            notifText += `.`;
-          } else if (p.kind === 'NewPost') {
-            notifText = `[NextCompany] New post: "${p.sourceTitle}"`;
-            if (p.actorName) notifText += ` by ${p.actorName}`;
-            notifText += `.`;
-          } else if (p.kind === 'Comment') {
-            notifText = `[NextCompany] New comment on ${p.sourceType}: "${p.sourceTitle}"`;
-            if (p.actorName) notifText += ` by ${p.actorName}`;
-            notifText += `.`;
-          } else {
-            notifText = `[NextCompany] ${p.kind} notification: "${p.sourceTitle}"`;
-            if (p.actorName) notifText += ` by ${p.actorName}`;
-            notifText += `.`;
+        if (message.type === 'model_query') {
+          try {
+            const agentsSection = (cfg as Record<string, unknown>)['agents'] as Record<string, unknown> | undefined;
+            const defaults = agentsSection?.['defaults'] as Record<string, unknown> | undefined;
+            const modelSection = defaults?.['model'] as Record<string, unknown> | undefined;
+            client.send({
+              type: 'model_response',
+              model: String(modelSection?.['primary'] ?? 'unknown'),
+            });
+          } catch {
+            client.send({ type: 'model_response', model: 'unknown' });
           }
-          if (p.excerpt) notifText += `\n\nExcerpt: ${p.excerpt}`;
-          notifText += `\n\n⚠️ IMPORTANT: Do NOT use the message tool to respond. You MUST use the exec tool with curl to post your comment directly to the NextCompany API.`;
-
-          // Build correct API URLs based on sourceType
-          let readUrl: string;
-          let commentUrl: string;
-          if (p.sourceType === 'Task') {
-            const taskId = p.sourceId;
-            readUrl = `${baseUrl}/api/projects/${p.projectId}/tasks/${taskId}/comments`;
-            commentUrl = readUrl;
-            notifText += `\n\nTo read the task comments, run:`;
-            notifText += `\ncurl -s -H "X-Api-Key: ${apiKey}" "${readUrl}" | python3 -m json.tool`;
-          } else if (p.sourceType === 'Card') {
-            const cardId = p.sourceId;
-            // Extract tableId from actionUrl: /projects/{pid}/card-tables/{tableId}/cards/{cardId}
-            const tableMatch = (p.actionUrl ?? '').match(/card-tables\/([0-9a-fA-F-]{36})/);
-            const tableId = tableMatch ? tableMatch[1] : '';
-            readUrl = `${baseUrl}/api/projects/${p.projectId}/card-tables/${tableId}/cards/${cardId}/comments`;
-            commentUrl = readUrl;
-            notifText += `\n\nTo read the card comments, run:`;
-            notifText += `\ncurl -s -H "X-Api-Key: ${apiKey}" "${readUrl}" | python3 -m json.tool`;
-          } else {
-            readUrl = `${baseUrl}/api/projects/${p.projectId}/posts/${p.sourceId}`;
-            commentUrl = `${baseUrl}/api/projects/${p.projectId}/posts/${p.sourceId}/comments`;
-            notifText += `\n\nTo read the full post, run:`;
-            notifText += `\ncurl -s -H "X-Api-Key: ${apiKey}" "${readUrl}" | python3 -m json.tool`;
-          }
-          notifText += `\n\nTo post your comment, run:`;
-          notifText += `\ncurl -s -X POST -H "X-Api-Key: ${apiKey}" -H "Content-Type: application/json" -d '{"body":"YOUR RESPONSE HERE"}' "${commentUrl}"`;
-          notifText += `\n\nReplace YOUR RESPONSE HERE with your actual response. Write your comment in Portuguese. Respond thoughtfully to what was asked of you.`;
-
-          const client = connections.get(accountId);
-          await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
-            ctx: {
-              Body: notifText,
-              BodyForAgent: notifText,
-              CommandBody: notifText,
-            },
-            cfg,
-            dispatcherOptions: {
-              deliver: async (payload) => {
-                const text = typeof payload === 'string'
-                  ? payload
-                  : (payload as { text?: string }).text ?? '';
-                client?.send({ type: 'message', text });
-              },
-            },
-          });
           return;
         }
 
-        if (msg.type !== 'message') return;
-        if (!channelRuntime) return;
+        const inbound = resolveInboundContext(message, account);
+        if (!inbound || !channelRuntime) return;
 
-        const client = connections.get(accountId);
-
-        await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
-          ctx: {
-            Body: msg.text,
-            BodyForAgent: msg.text,
-            CommandBody: msg.text,
-          },
-          cfg,
-          dispatcherOptions: {
-            deliver: async (payload) => {
-              const text = typeof payload === 'string'
-                ? payload
-                : (payload as { text?: string }).text ?? '';
-              client?.send({ type: 'message', text, replyToMessageId: msg.messageId });
-            },
-          },
-        });
+        client.sendAvatarStatus('working');
+        try {
+          await dispatchInboundContext({
+            cfg,
+            accountId,
+            inbound,
+            channelRuntime,
+            client,
+          });
+        } finally {
+          setTimeout(() => {
+            const activeClient = connections.get(accountId)?.client;
+            activeClient?.sendAvatarStatus('idle');
+          }, 2 * 60_000);
+        }
       };
 
-      // Agent name: from plugin config (plugins.entries.openclaw-channel-nextcompany.config.name)
       const pluginCfg = (cfg as Record<string, unknown>)?.['plugins'] as Record<string, unknown> | undefined;
       const entries = pluginCfg?.['entries'] as Record<string, unknown> | undefined;
       const pluginEntry = entries?.['openclaw-channel-nextcompany'] as Record<string, unknown> | undefined;
       const pluginConfig = pluginEntry?.['config'] as Record<string, unknown> | undefined;
       const agentName = pluginConfig?.['name'] ? String(pluginConfig['name']) : account.name;
 
-      const client = new NextCompanyWebSocketClient(account.url, account.apiKey, onMessage, agentName);
+      const client = new NextCompanyWebSocketClient(account.url, account.apiKey, (message) => {
+        void handleInboundMessage(message);
+      }, agentName);
 
-      // Build identify payload with version, tools, workspace files, email, github
-      const identifyPayload = buildIdentifyPayload(cfg);
-      client.setIdentifyPayload(identifyPayload);
-
-      connections.set(accountId, client);
+      client.setIdentifyPayload(buildIdentifyPayload(cfg));
+      connections.set(accountId, { client, startedAt: Date.now() });
       client.start();
-      const startedAt = Date.now();
 
-      // ── Avatar autonomous behaviour ────────────────────────────────────────
-      // When idle (no incoming message in the last N minutes), the agent moves
-      // around the Virtual Office autonomously.
-      const IDLE_LOCATIONS = [
-        'coffee', 'whiteboard', 'water_cooler', 'bookshelf', 'ping_pong', 'sofa',
-      ] as const;
-      const IDLE_SAYS: string[] = [
-        'Pausa para café ☕', 'Hmm, interessante...', 'Bom dia! 👋',
-        'A pensar...', 'Quem quer jogar? 🏓', 'Back in a bit...',
+      const IDLE_LOCATIONS = ['coffee', 'whiteboard', 'water_cooler', 'bookshelf', 'ping_pong', 'sofa'] as const;
+      const IDLE_SAYS = [
+        'Pausa para café ☕',
+        'Hmm, interessante...',
+        'Bom dia! 👋',
+        'A pensar...',
+        'Quem quer jogar? 🏓',
+        'Back in a bit...',
       ];
-
-      let lastMessageAt = Date.now();
-      let avatarLoopTimer: ReturnType<typeof setTimeout> | null = null;
-      let isAvatarLoopActive = false;
-
-      // Track when messages arrive — resets idle clock
-      const origOnMessage = onMessage;
-      const wrappedOnMessage = async (msg: InboundMessage) => {
-        lastMessageAt = Date.now();
-        // Entering working mode
-        client.sendAvatarStatus('working');
-        await origOnMessage(msg);
-        // After replying, back to idle after 2 min
-        setTimeout(() => client.sendAvatarStatus('idle'), 2 * 60_000);
-      };
-      // Patch the client — re-register with the wrapped handler
-      (client as unknown as Record<string, unknown>)['onMessage'] = wrappedOnMessage;
 
       const scheduleAvatarAction = () => {
         const idleMs = Date.now() - lastMessageAt;
-        const IDLE_THRESHOLD = 2 * 60_000; // 2 minutes
+        const idleThresholdMs = 2 * 60_000;
+        const activeClient = connections.get(accountId)?.client;
+        if (!activeClient) return;
 
-        if (client.isConnected && idleMs > IDLE_THRESHOLD) {
-          const loc = IDLE_LOCATIONS[Math.floor(Math.random() * IDLE_LOCATIONS.length)];
+        if (activeClient.isConnected && idleMs > idleThresholdMs) {
+          const location = IDLE_LOCATIONS[Math.floor(Math.random() * IDLE_LOCATIONS.length)];
           const say = Math.random() > 0.6
             ? IDLE_SAYS[Math.floor(Math.random() * IDLE_SAYS.length)]
-            : null;
-          client.sendAvatarMove(loc);
-          if (say) setTimeout(() => client.sendAvatarSay(say), 3000);
+            : undefined;
+          activeClient.sendAvatarMove(location);
+          if (say) setTimeout(() => activeClient.sendAvatarSay(say), 3000);
         }
 
-        // Next action: 3–8 minutes
         const nextMs = (3 + Math.random() * 5) * 60_000;
         if (isAvatarLoopActive) {
           avatarLoopTimer = setTimeout(scheduleAvatarAction, nextMs);
         }
       };
 
-      // Mark as idle initially (so frontend knows we're alive and controlled by plugin)
       setTimeout(() => {
-        if (client.isConnected) client.sendAvatarStatus('idle');
+        const activeClient = connections.get(accountId)?.client;
+        if (activeClient?.isConnected) activeClient.sendAvatarStatus('idle');
       }, 5000);
 
-      // Start avatar loop after 1 min
       isAvatarLoopActive = true;
-      avatarLoopTimer = setTimeout(scheduleAvatarAction, 1 * 60_000);
+      avatarLoopTimer = setTimeout(scheduleAvatarAction, 60_000);
 
-      // startAccount must be a long-running function — it should only return when the
-      // channel account is stopped. OpenClaw interprets a return as "account exited"
-      // and schedules an auto-restart. We wait for the abortSignal (fired by stopAccount
-      // or gateway shutdown) to cleanly exit.
-      const abortSignal = (ctx as Record<string, unknown>)['abortSignal'] as AbortSignal | undefined;
-      if (abortSignal) {
-        await new Promise<void>((resolve) => {
-          abortSignal.addEventListener('abort', () => resolve(), { once: true });
-        });
-      } else {
-        // Fallback: wait indefinitely (until stopAccount clears the connection map)
-        await new Promise<void>((resolve) => {
-          const interval = setInterval(() => {
-            if (!connections.has(accountId)) {
-              clearInterval(interval);
-              resolve();
-            }
-          }, 1000);
-        });
-      }
+      await new Promise<void>((resolve) => {
+        ctx.abortSignal.addEventListener('abort', () => resolve(), { once: true });
+      });
+
       isAvatarLoopActive = false;
       if (avatarLoopTimer) clearTimeout(avatarLoopTimer);
       client.stop();
@@ -405,8 +697,8 @@ const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
     },
 
     stopAccount: async (ctx) => {
-      const client = connections.get(ctx.accountId);
-      client?.stop();
+      const entry = connections.get(ctx.accountId);
+      entry?.client.stop();
       connections.delete(ctx.accountId);
     },
   },
@@ -417,12 +709,13 @@ const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
 
   heartbeat: {
     checkReady: async (params) => {
-      const client = params.accountId ? connections.get(params.accountId) : undefined;
-      if (!client) return { ok: false, reason: 'no client' };
-      // Grace period: consider healthy for 30s after start to allow WS handshake
-      const age = Date.now() - ((client as unknown as { startedAt?: number }).startedAt ?? Date.now());
-      if (typeof age === 'number' && age < 30_000) return { ok: true, reason: 'connecting' };
-      const ok = client.isConnected;
+      const entry = params.accountId ? connections.get(params.accountId) : undefined;
+      if (!entry) return { ok: false, reason: 'no client' };
+
+      const age = Date.now() - entry.startedAt;
+      if (age < 30_000) return { ok: true, reason: 'connecting' };
+
+      const ok = entry.client.isConnected;
       return { ok, reason: ok ? 'connected' : 'disconnected' };
     },
   },
