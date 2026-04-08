@@ -191,11 +191,16 @@ function joinContextLines(lines) {
         .map((line) => line?.trim())
         .filter((line) => Boolean(line));
 }
+function notificationField(message, camel, pascal) {
+    return message[camel]
+        ?? (pascal ? message[pascal] : undefined);
+}
 function formatNotificationSummary(message) {
-    const sourceType = normalizeLabel(message.sourceType, 'work item');
-    const title = normalizeLabel(message.sourceTitle, 'Untitled');
-    const actor = message.actorName?.trim();
-    switch (message.kind) {
+    const sourceType = normalizeLabel(notificationField(message, 'sourceType', 'SourceType'), 'work item');
+    const title = normalizeLabel(notificationField(message, 'sourceTitle', 'SourceTitle'), 'Untitled');
+    const actor = notificationField(message, 'actorName', 'ActorName')?.trim();
+    const kind = notificationField(message, 'kind', 'Kind') ?? 'Notification';
+    switch (kind) {
         case 'Assigned':
             return actor
                 ? `${actor} assigned you to ${sourceType} "${title}".`
@@ -214,72 +219,94 @@ function formatNotificationSummary(message) {
                 : `New comment on ${sourceType} "${title}".`;
         default:
             return actor
-                ? `${actor} triggered ${message.kind} on ${sourceType} "${title}".`
-                : `${message.kind} on ${sourceType} "${title}".`;
+                ? `${actor} triggered ${kind} on ${sourceType} "${title}".`
+                : `${kind} on ${sourceType} "${title}".`;
     }
 }
 function resolveNotificationMetadata(message) {
+    const metadata = message.metadata ?? message.Metadata ?? {};
     return {
-        ...(message.metadata ?? {}),
-        tableId: message.tableId ?? message.metadata?.tableId,
-        commentId: message.commentId ?? message.metadata?.commentId,
-        triggerKind: message.triggerKind ?? message.metadata?.triggerKind,
+        ...metadata,
+        tableId: notificationField(message, 'tableId', 'TableId') ?? metadata.tableId,
+        commentId: notificationField(message, 'commentId', 'CommentId') ?? metadata.commentId,
+        triggerKind: notificationField(message, 'triggerKind', 'TriggerKind') ?? metadata.triggerKind,
+        entityKind: notificationField(message, 'entityKind', 'EntityKind') ?? metadata.entityKind,
+        entityId: notificationField(message, 'entityId', 'EntityId') ?? metadata.entityId,
+        threadId: notificationField(message, 'threadId', 'ThreadId') ?? metadata.threadId,
+        conversationId: notificationField(message, 'conversationId', 'ConversationId') ?? metadata.conversationId,
+        mailboxId: notificationField(message, 'mailboxId', 'MailboxId') ?? metadata.mailboxId,
+        occurrenceId: notificationField(message, 'occurrenceId', 'OccurrenceId') ?? metadata.occurrenceId,
+        checkInId: notificationField(message, 'checkInId', 'CheckInId') ?? metadata.checkInId,
     };
 }
 function resolveNotificationEntityUrl(params) {
     const { baseUrl, message, metadata } = params;
-    if (message.actionUrl?.trim()) {
-        if (/^https?:\/\//i.test(message.actionUrl))
-            return message.actionUrl;
-        return `${baseUrl}${message.actionUrl.startsWith('/') ? '' : '/'}${message.actionUrl}`;
+    const actionUrl = notificationField(message, 'actionUrl', 'ActionUrl');
+    const projectId = notificationField(message, 'projectId', 'ProjectId');
+    const sourceType = notificationField(message, 'sourceType', 'SourceType');
+    const sourceId = notificationField(message, 'sourceId', 'SourceId');
+    if (actionUrl?.trim()) {
+        if (/^https?:\/\//i.test(actionUrl))
+            return actionUrl;
+        return `${baseUrl}${actionUrl.startsWith('/') ? '' : '/'}${actionUrl}`;
     }
-    switch (normalizeToken(message.sourceType)) {
+    switch (normalizeToken(sourceType)) {
         case 'card':
-            if (message.projectId && metadata.tableId) {
-                return `${baseUrl}/projects/${message.projectId}/boards/${metadata.tableId}/cards/${message.sourceId}`;
+            if (projectId && metadata.tableId) {
+                return `${baseUrl}/projects/${projectId}/boards/${metadata.tableId}/cards/${sourceId}`;
             }
             return undefined;
         case 'task':
-            return `${baseUrl}/projects/${message.projectId}/tasks/${message.sourceId}`;
+            return projectId && sourceId ? `${baseUrl}/projects/${projectId}/tasks/${sourceId}` : undefined;
         case 'post':
-            return `${baseUrl}/projects/${message.projectId}/posts/${message.sourceId}`;
+            return projectId && sourceId ? `${baseUrl}/projects/${projectId}/posts/${sourceId}` : undefined;
         default:
             return undefined;
     }
 }
 function buildNotificationContext(message, baseUrl) {
     const metadata = resolveNotificationMetadata(message);
-    const entityType = normalizeToken(metadata.entityKind ?? message.sourceType, 'notification');
-    const entityId = normalizeToken(metadata.entityId ?? message.sourceId ?? message.id, 'unknown');
-    const projectId = normalizeToken(message.projectId, 'project');
+    const sourceType = notificationField(message, 'sourceType', 'SourceType');
+    const sourceId = notificationField(message, 'sourceId', 'SourceId');
+    const sourceTitle = notificationField(message, 'sourceTitle', 'SourceTitle');
+    const projectIdRaw = notificationField(message, 'projectId', 'ProjectId');
+    const messageId = notificationField(message, 'id', 'Id');
+    const kind = notificationField(message, 'kind', 'Kind');
+    const actorName = notificationField(message, 'actorName', 'ActorName');
+    const projectName = notificationField(message, 'projectName', 'ProjectName');
+    const excerpt = notificationField(message, 'excerpt', 'Excerpt');
+    const createdAt = notificationField(message, 'createdAt', 'CreatedAt');
+    const entityType = normalizeToken(metadata.entityKind ?? sourceType, 'notification');
+    const entityId = normalizeToken(metadata.entityId ?? sourceId ?? messageId, 'unknown');
+    const projectId = normalizeToken(projectIdRaw, 'project');
     const peerId = `${entityType}:${projectId}:${entityId}`;
     const actionUrl = resolveNotificationEntityUrl({ baseUrl, message, metadata });
     const rawBody = [
         formatNotificationSummary(message),
-        message.excerpt?.trim() ? `Excerpt:\n${message.excerpt.trim()}` : undefined,
+        excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
     ]
         .filter((line) => Boolean(line))
         .join('\n\n');
     return {
         rawBody,
-        from: message.actorName?.trim()
-            ? `nextcompany:actor:${normalizeToken(message.actorName)}`
+        from: actorName?.trim()
+            ? `nextcompany:actor:${normalizeToken(actorName)}`
             : 'nextcompany:system',
-        fromLabel: normalizeLabel(message.actorName, CHANNEL_LABEL),
+        fromLabel: normalizeLabel(actorName, CHANNEL_LABEL),
         to: `nextcompany:${peerId}`,
         peerId,
-        conversationLabel: `${normalizeLabel(message.sourceType, 'Work')}: ${normalizeLabel(message.sourceTitle, 'Untitled')}`,
-        timestamp: toTimestamp(message.createdAt),
-        messageSid: metadata.commentId ?? message.id,
-        replyToId: metadata.commentId ?? message.id,
-        senderName: normalizeLabel(message.actorName, CHANNEL_LABEL),
-        senderId: message.actorName?.trim() ? normalizeToken(message.actorName) : 'system',
+        conversationLabel: `${normalizeLabel(sourceType, 'Work')}: ${normalizeLabel(sourceTitle, 'Untitled')}`,
+        timestamp: toTimestamp(createdAt),
+        messageSid: metadata.commentId ?? messageId,
+        replyToId: metadata.commentId ?? messageId,
+        senderName: normalizeLabel(actorName, CHANNEL_LABEL),
+        senderId: actorName?.trim() ? normalizeToken(actorName) : 'system',
         untrustedContext: joinContextLines([
-            `Notification kind: ${message.kind}`,
+            `Notification kind: ${kind}`,
             metadata.triggerKind ? `Trigger kind: ${metadata.triggerKind}` : undefined,
-            `Entity type: ${normalizeLabel(message.sourceType, 'unknown')}`,
-            `Entity id: ${message.sourceId}`,
-            message.projectName ? `Project: ${message.projectName}` : `Project id: ${message.projectId}`,
+            `Entity type: ${normalizeLabel(sourceType, 'unknown')}`,
+            sourceId ? `Entity id: ${sourceId}` : undefined,
+            projectName ? `Project: ${projectName}` : `Project id: ${projectIdRaw}`,
             metadata.tableId ? `Table id: ${metadata.tableId}` : undefined,
             metadata.commentId ? `Comment id: ${metadata.commentId}` : undefined,
             actionUrl ? `Open in NextCompany: ${actionUrl}` : undefined,

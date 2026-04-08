@@ -45,23 +45,54 @@ export interface NextCompanyDirectMessage {
 
 export interface NextCompanyNotificationMessage {
   type: 'notification';
-  kind: string;
-  sourceType: string;
-  sourceId: string;
-  sourceTitle: string;
-  projectId: string;
+  kind?: string;
+  Kind?: string;
+  sourceType?: string;
+  SourceType?: string;
+  sourceId?: string;
+  SourceId?: string;
+  sourceTitle?: string;
+  SourceTitle?: string;
+  projectId?: string;
+  ProjectId?: string;
   excerpt?: string;
+  Excerpt?: string;
   actorName?: string;
+  ActorName?: string;
   actorAvatarUrl?: string;
+  ActorAvatarUrl?: string;
   actionUrl?: string;
+  ActionUrl?: string;
   projectName?: string;
+  ProjectName?: string;
   id?: string;
+  Id?: string;
   isRead?: boolean;
+  IsRead?: boolean;
   createdAt?: string;
+  CreatedAt?: string;
   tableId?: string;
+  TableId?: string;
   commentId?: string;
+  CommentId?: string;
   triggerKind?: string;
+  TriggerKind?: string;
+  entityKind?: string;
+  EntityKind?: string;
+  entityId?: string;
+  EntityId?: string;
+  threadId?: string;
+  ThreadId?: string;
+  conversationId?: string;
+  ConversationId?: string;
+  mailboxId?: string;
+  MailboxId?: string;
+  occurrenceId?: string;
+  OccurrenceId?: string;
+  checkInId?: string;
+  CheckInId?: string;
   metadata?: NextCompanyNotificationMetadata;
+  Metadata?: NextCompanyNotificationMetadata;
 }
 
 export interface NextCompanyReadFileMessage {
