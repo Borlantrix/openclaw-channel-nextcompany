@@ -7,6 +7,9 @@ import { createAccountListHelpers } from 'openclaw/plugin-sdk';
 import type {
   InboundMessage,
   NextCompanyAccountConfig,
+  NextCompanyAgentWakeMessage,
+  NextCompanyAgentWorkItem,
+  NextCompanyAgentWorkItemPayload,
   NextCompanyCheckInMessage,
   NextCompanyDirectMessage,
   NextCompanyMailboxEmailMessage,
@@ -39,6 +42,15 @@ interface RoutedInboundContext {
   senderId?: string;
   senderUsername?: string;
   untrustedContext?: string[];
+  workItemId?: string;
+  sessionKey?: string;
+}
+
+interface NextCompanyTransitionBody {
+  metadataJson?: string;
+  sessionKey?: string;
+  error?: string;
+  occurredAt?: string;
 }
 
 function getAccounts(cfg: OpenClawConfig): Record<string, NextCompanyAccountConfig> {
@@ -210,6 +222,48 @@ function normalizeBaseUrl(url: string): string {
     .replace(/\/ws\/agents\/?$/, '');
 }
 
+function buildNextCompanyApiUrl(account: NextCompanyAccountConfig, path: string): string {
+  const baseUrl = normalizeBaseUrl(account.url).replace(/\/+$/, '');
+  return `${baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function serializeTransitionBody(body: NextCompanyTransitionBody): string | undefined {
+  const payload = Object.fromEntries(
+    Object.entries({
+      metadataJson: body.metadataJson,
+      sessionKey: body.sessionKey,
+      error: body.error,
+      occurredAt: body.occurredAt,
+    }).filter(([, value]) => value !== undefined),
+  );
+  return Object.keys(payload).length > 0 ? JSON.stringify(payload) : undefined;
+}
+
+async function nextCompanyApiRequest<T>(params: {
+  account: NextCompanyAccountConfig;
+  path: string;
+  method?: 'GET' | 'POST';
+  body?: string;
+}): Promise<T> {
+  const response = await fetch(buildNextCompanyApiUrl(params.account, params.path), {
+    method: params.method ?? 'GET',
+    headers: {
+      Authorization: `Bearer ${params.account.apiKey}`,
+      Accept: 'application/json',
+      ...(params.body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: params.body,
+  });
+
+  if (!response.ok) {
+    const responseText = await response.text().catch(() => '');
+    throw new Error(`NextCompany API ${params.method ?? 'GET'} ${params.path} failed: ${response.status}${responseText ? ` ${responseText}` : ''}`);
+  }
+
+  if (response.status === 204) return undefined as T;
+  return await response.json() as T;
+}
+
 function normalizeToken(value: string | undefined, fallback = 'unknown'): string {
   const normalized = (value ?? '')
     .trim()
@@ -236,9 +290,25 @@ function joinContextLines(lines: Array<string | undefined>): string[] {
     .filter((line): line is string => Boolean(line));
 }
 
+function workItemPayloadField<T = string>(payload: NextCompanyAgentWorkItemPayload | undefined | null, key: keyof NextCompanyAgentWorkItemPayload): T | undefined {
+  return payload?.[key] as T | undefined;
+}
+
 function notificationField<T = string>(message: NextCompanyNotificationMessage, camel: keyof NextCompanyNotificationMessage, pascal?: keyof NextCompanyNotificationMessage): T | undefined {
   return (message[camel] as T | undefined)
     ?? (pascal ? (message[pascal] as T | undefined) : undefined);
+}
+
+function wakeField<T = string>(message: NextCompanyAgentWakeMessage, camel: keyof NextCompanyAgentWakeMessage, pascal?: keyof NextCompanyAgentWakeMessage): T | undefined {
+  return (message[camel] as T | undefined)
+    ?? (pascal ? (message[pascal] as T | undefined) : undefined);
+}
+
+function resolveReferencedWorkItemId(message: NextCompanyNotificationMessage | NextCompanyAgentWakeMessage): string | undefined {
+  if (message.type === 'agent_wake') {
+    return wakeField(message, 'workItemId', 'WorkItemId')?.trim();
+  }
+  return notificationField(message, 'workItemId', 'WorkItemId')?.trim();
 }
 
 function formatNotificationSummary(message: NextCompanyNotificationMessage): string {
@@ -317,6 +387,122 @@ function resolveNotificationEntityUrl(params: {
     default:
       return undefined;
   }
+}
+
+function resolveWorkItemEntityUrl(params: {
+  baseUrl: string;
+  workItem: NextCompanyAgentWorkItem;
+}): string | undefined {
+  const { baseUrl, workItem } = params;
+  const actionUrl = workItemPayloadField(workItem.payload, 'actionUrl');
+  const tableId = workItemPayloadField(workItem.payload, 'tableId');
+
+  if (actionUrl?.trim()) {
+    if (/^https?:\/\//i.test(actionUrl)) return actionUrl;
+    return `${baseUrl}${actionUrl.startsWith('/') ? '' : '/'}${actionUrl}`;
+  }
+
+  switch (normalizeToken(workItem.sourceType)) {
+    case 'card':
+      return workItem.projectId && tableId
+        ? `${baseUrl}/projects/${workItem.projectId}/boards/${tableId}/cards/${workItem.sourceId}`
+        : undefined;
+    case 'task':
+      return workItem.projectId && workItem.sourceId
+        ? `${baseUrl}/projects/${workItem.projectId}/tasks/${workItem.sourceId}`
+        : undefined;
+    case 'post':
+      return workItem.projectId && workItem.sourceId
+        ? `${baseUrl}/projects/${workItem.projectId}/posts/${workItem.sourceId}`
+        : undefined;
+    default:
+      return undefined;
+  }
+}
+
+function buildWorkItemSummary(workItem: NextCompanyAgentWorkItem): string {
+  const title = normalizeLabel(workItemPayloadField(workItem.payload, 'sourceTitle'), 'Untitled');
+  const sourceType = normalizeLabel(workItem.sourceType, 'work item');
+  const actor = workItemPayloadField(workItem.payload, 'actorName')?.trim();
+  const triggerKind = normalizeLabel(workItem.triggerKind, 'Notification');
+
+  switch (triggerKind) {
+    case 'Assigned':
+      return actor
+        ? `${actor} assigned you to ${sourceType} "${title}".`
+        : `You were assigned to ${sourceType} "${title}".`;
+    case 'Mention':
+      return actor
+        ? `${actor} mentioned you in ${sourceType} "${title}".`
+        : `You were mentioned in ${sourceType} "${title}".`;
+    case 'NewPost':
+      return actor
+        ? `${actor} published a new post "${title}".`
+        : `New post "${title}".`;
+    case 'Comment':
+      return actor
+        ? `${actor} commented on ${sourceType} "${title}".`
+        : `New comment on ${sourceType} "${title}".`;
+    default:
+      return actor
+        ? `${actor} triggered ${triggerKind} on ${sourceType} "${title}".`
+        : `${triggerKind} on ${sourceType} "${title}".`;
+  }
+}
+
+function buildWorkItemContext(workItem: NextCompanyAgentWorkItem, account: NextCompanyAccountConfig): RoutedInboundContext {
+  const payload = workItem.payload;
+  const sourceTitle = workItemPayloadField(payload, 'sourceTitle');
+  const actorName = workItemPayloadField(payload, 'actorName');
+  const excerpt = workItemPayloadField(payload, 'excerpt');
+  const entityType = normalizeToken(workItemPayloadField(payload, 'entityKind') ?? workItem.sourceType, 'notification');
+  const entityId = normalizeToken(workItemPayloadField(payload, 'entityId') ?? workItem.sourceId ?? workItem.id, 'unknown');
+  const projectId = normalizeToken(workItem.projectId, 'project');
+  const actionUrl = resolveWorkItemEntityUrl({ baseUrl: normalizeBaseUrl(account.url), workItem });
+  const peerId = `${entityType}:${projectId}:${entityId}`;
+  const rawBody = [
+    buildWorkItemSummary(workItem),
+    excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n\n');
+
+  return {
+    rawBody,
+    from: actorName?.trim()
+      ? `nextcompany:actor:${normalizeToken(actorName)}`
+      : 'nextcompany:system',
+    fromLabel: normalizeLabel(actorName, CHANNEL_LABEL),
+    to: `nextcompany:${peerId}`,
+    peerId,
+    conversationLabel: `${normalizeLabel(workItem.sourceType, 'Work')}: ${normalizeLabel(sourceTitle, 'Untitled')}`,
+    timestamp: toTimestamp(workItem.createdAt),
+    messageSid: workItem.commentId ?? workItem.notificationId ?? workItem.id,
+    replyToId: workItem.commentId ?? workItem.notificationId ?? workItem.id,
+    senderName: normalizeLabel(actorName, CHANNEL_LABEL),
+    senderId: actorName?.trim() ? normalizeToken(actorName) : 'system',
+    untrustedContext: joinContextLines([
+      `Work item id: ${workItem.id}`,
+      `Status: ${workItem.status}`,
+      `Trigger kind: ${workItem.triggerKind}`,
+      `Entity type: ${normalizeLabel(workItem.sourceType, 'unknown')}`,
+      `Entity id: ${workItem.sourceId}`,
+      `Project id: ${workItem.projectId}`,
+      workItem.commentId ? `Comment id: ${workItem.commentId}` : undefined,
+      workItem.notificationId ? `Notification id: ${workItem.notificationId}` : undefined,
+      workItem.correlationKey ? `Correlation key: ${workItem.correlationKey}` : undefined,
+      workItem.sessionKey ? `Existing session key: ${workItem.sessionKey}` : undefined,
+      workItemPayloadField(payload, 'tableId') ? `Table id: ${workItemPayloadField(payload, 'tableId')}` : undefined,
+      workItemPayloadField(payload, 'threadId') ? `Thread id: ${workItemPayloadField(payload, 'threadId')}` : undefined,
+      workItemPayloadField(payload, 'conversationId') ? `Conversation id: ${workItemPayloadField(payload, 'conversationId')}` : undefined,
+      workItemPayloadField(payload, 'mailboxId') ? `Mailbox id: ${workItemPayloadField(payload, 'mailboxId')}` : undefined,
+      workItemPayloadField(payload, 'occurrenceId') ? `Occurrence id: ${workItemPayloadField(payload, 'occurrenceId')}` : undefined,
+      workItemPayloadField(payload, 'checkInId') ? `Check-in id: ${workItemPayloadField(payload, 'checkInId')}` : undefined,
+      actionUrl ? `Open in NextCompany: ${actionUrl}` : undefined,
+    ]),
+    workItemId: workItem.id,
+    sessionKey: workItem.sessionKey ?? undefined,
+  };
 }
 
 function buildNotificationContext(message: NextCompanyNotificationMessage, baseUrl: string): RoutedInboundContext {
@@ -465,14 +651,76 @@ function buildMailboxContext(message: NextCompanyMailboxEmailMessage): RoutedInb
   };
 }
 
+async function fetchAgentWorkItem(account: NextCompanyAccountConfig, workItemId: string): Promise<NextCompanyAgentWorkItem> {
+  return await nextCompanyApiRequest<NextCompanyAgentWorkItem>({
+    account,
+    path: `/api/agents/me/inbox/${workItemId}`,
+  });
+}
+
+async function transitionAgentWorkItem(params: {
+  account: NextCompanyAccountConfig;
+  workItemId: string;
+  action: 'delivered' | 'ack' | 'claim';
+  body?: NextCompanyTransitionBody;
+}): Promise<NextCompanyAgentWorkItem> {
+  return await nextCompanyApiRequest<NextCompanyAgentWorkItem>({
+    account: params.account,
+    path: `/api/agent-work-items/${params.workItemId}/${params.action}`,
+    method: 'POST',
+    body: serializeTransitionBody(params.body ?? {}),
+  });
+}
+
+async function resolveInboundContext(message: InboundMessage, account: NextCompanyAccountConfig): Promise<RoutedInboundContext | undefined> {
+  const referencedWorkItemId = (
+    message.type === 'agent_wake' || message.type === 'notification'
+  ) ? resolveReferencedWorkItemId(message) : undefined;
+
+  if (referencedWorkItemId) {
+    if (message.type === 'agent_wake') {
+      await transitionAgentWorkItem({
+        account,
+        workItemId: referencedWorkItemId,
+        action: 'delivered',
+        body: {
+          metadataJson: JSON.stringify({
+            transport: 'websocket',
+            state: 'received-by-plugin',
+            messageType: message.type,
+            wakeReason: wakeField(message, 'wakeReason', 'WakeReason'),
+          }),
+        },
+      });
+    }
+
+    const workItem = await fetchAgentWorkItem(account, referencedWorkItemId);
+    return buildWorkItemContext(workItem, account);
+  }
+
+  switch (message.type) {
+    case 'message':
+      return buildMessageContext(message);
+    case 'notification':
+      return buildNotificationContext(message, normalizeBaseUrl(account.url));
+    case 'check_in':
+      return buildCheckInContext(message);
+    case 'mailbox_email':
+      return buildMailboxContext(message);
+    default:
+      return undefined;
+  }
+}
+
 async function dispatchInboundContext(params: {
   cfg: OpenClawConfig;
   accountId: string;
+  account: NextCompanyAccountConfig;
   inbound: RoutedInboundContext;
   channelRuntime: ChannelRuntime;
   client: NextCompanyWebSocketClient;
 }): Promise<void> {
-  const { cfg, accountId, inbound, channelRuntime, client } = params;
+  const { cfg, accountId, account, inbound, channelRuntime, client } = params;
   const route = channelRuntime.routing.resolveAgentRoute({
     cfg,
     channel: CHANNEL_ID,
@@ -500,6 +748,39 @@ async function dispatchInboundContext(params: {
     body: inbound.rawBody,
   });
 
+  const resolvedSessionKey = route.sessionKey ?? inbound.sessionKey;
+
+  if (inbound.workItemId) {
+    await transitionAgentWorkItem({
+      account,
+      workItemId: inbound.workItemId,
+      action: 'ack',
+      body: {
+        sessionKey: resolvedSessionKey,
+        metadataJson: JSON.stringify({
+          transport: 'openclaw-plugin',
+          state: 'accepted-for-routing',
+          accountId,
+        }),
+      },
+    });
+
+    await transitionAgentWorkItem({
+      account,
+      workItemId: inbound.workItemId,
+      action: 'claim',
+      body: {
+        sessionKey: resolvedSessionKey,
+        metadataJson: JSON.stringify({
+          transport: 'openclaw-plugin',
+          state: 'dispatching-to-runtime',
+          accountId,
+          agentId: route.agentId,
+        }),
+      },
+    });
+  }
+
   const ctxPayload = channelRuntime.reply.finalizeInboundContext({
     Body: body,
     BodyForAgent: inbound.rawBody,
@@ -507,7 +788,7 @@ async function dispatchInboundContext(params: {
     CommandBody: inbound.rawBody,
     From: inbound.from,
     To: inbound.to,
-    SessionKey: route.sessionKey,
+    SessionKey: resolvedSessionKey,
     AccountId: route.accountId,
     ChatType: 'direct',
     ConversationLabel: inbound.conversationLabel,
@@ -529,7 +810,7 @@ async function dispatchInboundContext(params: {
 
   await channelRuntime.session.recordInboundSession({
     storePath,
-    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+    sessionKey: ctxPayload.SessionKey ?? resolvedSessionKey,
     ctx: ctxPayload,
     onRecordError: (err) => {
       console.error('[NC] failed updating session metadata', err);
@@ -556,21 +837,6 @@ async function dispatchInboundContext(params: {
       },
     },
   });
-}
-
-function resolveInboundContext(message: InboundMessage, account: NextCompanyAccountConfig): RoutedInboundContext | undefined {
-  switch (message.type) {
-    case 'message':
-      return buildMessageContext(message);
-    case 'notification':
-      return buildNotificationContext(message, normalizeBaseUrl(account.url));
-    case 'check_in':
-      return buildCheckInContext(message);
-    case 'mailbox_email':
-      return buildMailboxContext(message);
-    default:
-      return undefined;
-  }
 }
 
 const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
@@ -642,17 +908,24 @@ const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
           return;
         }
 
-        const inbound = resolveInboundContext(message, account);
-        if (!inbound || !channelRuntime) return;
-
-        client.sendAvatarStatus('working');
         try {
+          const inbound = await resolveInboundContext(message, account);
+          if (!inbound || !channelRuntime) return;
+
+          client.sendAvatarStatus('working');
           await dispatchInboundContext({
             cfg,
             accountId,
+            account,
             inbound,
             channelRuntime,
             client,
+          });
+        } catch (err) {
+          console.error('[NC] inbound handling failed', {
+            accountId,
+            messageType: message.type,
+            err,
           });
         } finally {
           setTimeout(() => {

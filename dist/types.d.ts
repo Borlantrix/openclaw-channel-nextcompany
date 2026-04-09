@@ -39,6 +39,8 @@ export interface NextCompanyDirectMessage {
 }
 export interface NextCompanyNotificationMessage {
     type: 'notification';
+    workItemId?: string;
+    WorkItemId?: string;
     kind?: string;
     Kind?: string;
     sourceType?: string;
@@ -88,6 +90,33 @@ export interface NextCompanyNotificationMessage {
     metadata?: NextCompanyNotificationMetadata;
     Metadata?: NextCompanyNotificationMetadata;
 }
+export interface NextCompanyAgentWakeMessage {
+    type: 'agent_wake';
+    workItemId?: string;
+    WorkItemId?: string;
+    agentId?: string;
+    AgentId?: string;
+    organizationId?: string;
+    OrganizationId?: string;
+    projectId?: string;
+    ProjectId?: string;
+    notificationId?: string;
+    NotificationId?: string;
+    wakeReason?: string;
+    WakeReason?: string;
+    sourceType?: string;
+    SourceType?: string;
+    sourceId?: string;
+    SourceId?: string;
+    sessionKey?: string;
+    SessionKey?: string;
+    correlationKey?: string;
+    CorrelationKey?: string;
+    createdAt?: string;
+    CreatedAt?: string;
+    metadata?: NextCompanyNotificationMetadata;
+    Metadata?: NextCompanyNotificationMetadata;
+}
 export interface NextCompanyReadFileMessage {
     type: 'readFile';
     file: string;
@@ -122,7 +151,59 @@ export interface NextCompanyMailboxEmailMessage {
 export interface NextCompanyPongMessage {
     type: 'pong';
 }
-export type InboundMessage = NextCompanyConnectedMessage | NextCompanyIdentifiedMessage | NextCompanyDirectMessage | NextCompanyNotificationMessage | NextCompanyReadFileMessage | NextCompanyModelQueryMessage | NextCompanyCheckInMessage | NextCompanyMailboxEmailMessage | NextCompanyPongMessage;
+export interface NextCompanyAgentInboxEvent {
+    id: string;
+    fromStatus?: string | null;
+    toStatus: string;
+    eventKind: string;
+    occurredAt: string;
+    actorType: string;
+    actorId?: string | null;
+    metadata?: unknown;
+}
+export interface NextCompanyAgentWorkItemPayload {
+    notificationKind?: string;
+    sourceTitle?: string;
+    excerpt?: string | null;
+    actorName?: string;
+    actorAvatarUrl?: string | null;
+    actionUrl?: string;
+    tableId?: string | null;
+    entityKind?: string | null;
+    entityId?: string;
+    threadId?: string | null;
+    conversationId?: string | null;
+    mailboxId?: string | null;
+    occurrenceId?: string | null;
+    checkInId?: string | null;
+}
+export interface NextCompanyAgentWorkItem {
+    id: string;
+    organizationId: string;
+    projectId: string;
+    agentId: string;
+    notificationId?: string | null;
+    sourceType: string;
+    sourceId: string;
+    commentId?: string | null;
+    triggerKind: string;
+    status: string;
+    payload?: NextCompanyAgentWorkItemPayload | null;
+    createdAt: string;
+    wakeSentAt?: string | null;
+    deliveredAt?: string | null;
+    ackedAt?: string | null;
+    claimedAt?: string | null;
+    startedAt?: string | null;
+    completedAt?: string | null;
+    failedAt?: string | null;
+    attemptCount: number;
+    lastError?: string | null;
+    sessionKey?: string | null;
+    correlationKey?: string | null;
+    events?: NextCompanyAgentInboxEvent[];
+}
+export type InboundMessage = NextCompanyConnectedMessage | NextCompanyIdentifiedMessage | NextCompanyDirectMessage | NextCompanyNotificationMessage | NextCompanyAgentWakeMessage | NextCompanyReadFileMessage | NextCompanyModelQueryMessage | NextCompanyCheckInMessage | NextCompanyMailboxEmailMessage | NextCompanyPongMessage;
 export type OutboundMessage = {
     type: 'message';
     text: string;
