@@ -196,7 +196,7 @@ function getGithubPrExecutorConfig(cfg) {
         : undefined;
     return {
         enabled: raw?.['enabled'] === undefined ? true : Boolean(raw['enabled']),
-        mode: raw?.['mode'] === 'command' ? 'command' : 'claude',
+        mode: raw?.['mode'] === 'command' ? 'command' : 'codex',
         command: raw?.['command'] ? String(raw['command']) : undefined,
         args: Array.isArray(raw?.['args']) ? raw?.['args'].map((v) => String(v)) : undefined,
         timeoutMs: typeof raw?.['timeoutMs'] === 'number' ? raw['timeoutMs'] : 20 * 60_000,
@@ -674,7 +674,7 @@ async function fetchExecutionContext(account, cardId) {
         return undefined;
     }
 }
-function buildClaudeGithubPrPrompt(params) {
+function buildCodexGithubPrPrompt(params) {
     const payload = params.workItem.payload ?? {};
     const card = params.executionContext?.['card'];
     const currentStage = params.executionContext?.['currentStage'];
@@ -738,12 +738,12 @@ async function executeGithubPrWorkItem(params) {
         });
     }
     else {
-        if (!commandExists('claude')) {
-            throw new Error('github_pr executor is not configured and Claude Code CLI is unavailable.');
+        if (!commandExists('codex')) {
+            throw new Error('github_pr executor is not configured and Codex CLI is unavailable.');
         }
         rawResult = await runProcessJson({
-            command: 'claude',
-            args: ['--permission-mode', 'bypassPermissions', '--print', buildClaudeGithubPrPrompt({
+            command: 'codex',
+            args: ['exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', buildCodexGithubPrPrompt({
                     workItem,
                     repoPath,
                     executionContext,

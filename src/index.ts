@@ -56,7 +56,7 @@ interface NextCompanyTransitionBody {
 
 interface GithubPrExecutorConfig {
   enabled?: boolean;
-  mode?: 'claude' | 'command';
+  mode?: 'codex' | 'command';
   command?: string;
   args?: string[];
   timeoutMs?: number;
@@ -273,7 +273,7 @@ function getGithubPrExecutorConfig(cfg: OpenClawConfig): GithubPrExecutorConfig 
 
   return {
     enabled: raw?.['enabled'] === undefined ? true : Boolean(raw['enabled']),
-    mode: raw?.['mode'] === 'command' ? 'command' : 'claude',
+    mode: raw?.['mode'] === 'command' ? 'command' : 'codex',
     command: raw?.['command'] ? String(raw['command']) : undefined,
     args: Array.isArray(raw?.['args']) ? raw?.['args'].map((v) => String(v)) : undefined,
     timeoutMs: typeof raw?.['timeoutMs'] === 'number' ? (raw['timeoutMs'] as number) : 20 * 60_000,
@@ -813,7 +813,7 @@ async function fetchExecutionContext(account: NextCompanyAccountConfig, cardId: 
   }
 }
 
-function buildClaudeGithubPrPrompt(params: {
+function buildCodexGithubPrPrompt(params: {
   workItem: NextCompanyAgentWorkItem;
   repoPath: string;
   executionContext?: Record<string, unknown>;
@@ -890,13 +890,13 @@ async function executeGithubPrWorkItem(params: {
       }),
     });
   } else {
-    if (!commandExists('claude')) {
-      throw new Error('github_pr executor is not configured and Claude Code CLI is unavailable.');
+    if (!commandExists('codex')) {
+      throw new Error('github_pr executor is not configured and Codex CLI is unavailable.');
     }
 
     rawResult = await runProcessJson({
-      command: 'claude',
-      args: ['--permission-mode', 'bypassPermissions', '--print', buildClaudeGithubPrPrompt({
+      command: 'codex',
+      args: ['exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', buildCodexGithubPrPrompt({
         workItem,
         repoPath,
         executionContext,
