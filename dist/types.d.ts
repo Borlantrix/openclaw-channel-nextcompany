@@ -162,6 +162,13 @@ export interface NextCompanyAgentInboxEvent {
     metadata?: unknown;
 }
 export interface NextCompanyAgentWorkItemPayload {
+    kind?: string;
+    cardId?: string;
+    repositorySlug?: string;
+    baseBranch?: string | null;
+    branchPrefix?: string | null;
+    title?: string | null;
+    bodyTemplate?: string | null;
     notificationKind?: string;
     sourceTitle?: string;
     excerpt?: string | null;
