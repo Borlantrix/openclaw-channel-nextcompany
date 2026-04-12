@@ -185,7 +185,7 @@ async function nextCompanyApiRequest(params) {
     const response = await fetch(buildNextCompanyApiUrl(params.account, params.path), {
         method: params.method ?? 'GET',
         headers: {
-            Authorization: `Bearer ${params.account.apiKey}`,
+            'X-Api-Key': params.account.apiKey,
             Accept: 'application/json',
             ...(params.body ? { 'Content-Type': 'application/json' } : {}),
         },
