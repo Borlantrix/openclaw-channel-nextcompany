@@ -802,6 +802,125 @@ async function transitionAgentWorkItem(params: {
   });
 }
 
+interface NextCompanyProjectTask {
+  id: string;
+  taskListId: string;
+  projectId: string;
+  isCompleted: boolean;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function plainTextToHtml(value: string): string {
+  const normalized = value.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return '';
+
+  return normalized
+    .split(/\n\s*\n/)
+    .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, '<br/>')}</p>`)
+    .join('');
+}
+
+function resolveTaskRouteFromWorkItem(workItem: NextCompanyAgentWorkItem): { projectId: string; listId: string; taskId: string } | undefined {
+  let projectId = workItem.projectId?.trim();
+  let taskId = workItem.sourceId?.trim();
+  let listId: string | undefined;
+  const actionUrl = workItemPayloadField(workItem.payload, 'actionUrl');
+
+  if (actionUrl?.trim()) {
+    try {
+      const pathname = new URL(actionUrl, 'https://nextcompany.invalid').pathname;
+      const parts = pathname.split('/').filter(Boolean);
+      if (parts[0] === 'projects' && parts[2] === 'tasks') {
+        projectId = projectId ?? parts[1];
+        if (parts[4]) {
+          listId = parts[3];
+          taskId = taskId ?? parts[4];
+        }
+      }
+    } catch {
+      // Ignore malformed URLs and fall back to work-item fields.
+    }
+  }
+
+  if (!projectId || !taskId || !listId) return undefined;
+  return { projectId, listId, taskId };
+}
+
+async function fetchTask(account: NextCompanyAccountConfig, projectId: string, listId: string, taskId: string): Promise<NextCompanyProjectTask> {
+  return await nextCompanyApiRequest<NextCompanyProjectTask>({
+    account,
+    path: `/api/projects/${projectId}/task-lists/${listId}/tasks/${taskId}`,
+  });
+}
+
+async function createTaskComment(params: {
+  account: NextCompanyAccountConfig;
+  projectId: string;
+  taskId: string;
+  text: string;
+}): Promise<void> {
+  const body = plainTextToHtml(params.text);
+  if (!body.trim()) return;
+
+  await nextCompanyApiRequest({
+    account: params.account,
+    path: `/api/projects/${params.projectId}/tasks/${params.taskId}/comments`,
+    method: 'POST',
+    body: JSON.stringify({ body }),
+  });
+}
+
+async function completeTaskIfNeeded(params: {
+  account: NextCompanyAccountConfig;
+  projectId: string;
+  listId: string;
+  taskId: string;
+}): Promise<void> {
+  const task = await fetchTask(params.account, params.projectId, params.listId, params.taskId);
+  if (task.isCompleted) return;
+
+  await nextCompanyApiRequest({
+    account: params.account,
+    path: `/api/projects/${params.projectId}/task-lists/${params.listId}/tasks/${params.taskId}/toggle`,
+    method: 'POST',
+  });
+}
+
+async function persistTaskReplyAndComplete(params: {
+  account: NextCompanyAccountConfig;
+  workItem: NextCompanyAgentWorkItem;
+  text: string;
+}): Promise<{ projectId: string; listId: string; taskId: string }> {
+  const taskRoute = resolveTaskRouteFromWorkItem(params.workItem);
+  if (!taskRoute) {
+    throw new Error(`Unable to resolve task route for work item ${params.workItem.id}.`);
+  }
+
+  await createTaskComment({
+    account: params.account,
+    projectId: taskRoute.projectId,
+    taskId: taskRoute.taskId,
+    text: params.text,
+  });
+
+  await completeTaskIfNeeded({
+    account: params.account,
+    projectId: taskRoute.projectId,
+    listId: taskRoute.listId,
+    taskId: taskRoute.taskId,
+  });
+
+  return taskRoute;
+}
+
 async function fetchExecutionContext(account: NextCompanyAccountConfig, cardId: string): Promise<Record<string, unknown> | undefined> {
   try {
     return await nextCompanyApiRequest<Record<string, unknown>>({
@@ -1137,11 +1256,63 @@ async function dispatchInboundContext(params: {
           ? payload
           : (payload as { text?: string; replyToId?: string }).text ?? '';
         if (!text.trim()) return;
-        client.send({
-          type: 'message',
-          text,
-          replyToMessageId: inbound.replyToId,
-        });
+
+        try {
+          if (inbound.workItem && normalizeToken(inbound.workItem.sourceType) === 'task') {
+            const taskRoute = await persistTaskReplyAndComplete({
+              account,
+              workItem: inbound.workItem,
+              text,
+            });
+
+            if (inbound.workItemId) {
+              await transitionAgentWorkItem({
+                account,
+                workItemId: inbound.workItemId,
+                action: 'complete',
+                body: {
+                  sessionKey: resolvedSessionKey,
+                  metadataJson: JSON.stringify({
+                    transport: 'openclaw-plugin',
+                    state: 'task-commented-and-completed',
+                    projectId: taskRoute.projectId,
+                    taskListId: taskRoute.listId,
+                    taskId: taskRoute.taskId,
+                  }),
+                },
+              });
+            }
+            return;
+          }
+
+          client.send({
+            type: 'message',
+            text,
+            replyToMessageId: inbound.replyToId,
+          });
+        } catch (error) {
+          if (inbound.workItemId) {
+            const message = error instanceof Error ? error.message : String(error);
+            try {
+              await transitionAgentWorkItem({
+                account,
+                workItemId: inbound.workItemId,
+                action: 'fail',
+                body: {
+                  sessionKey: resolvedSessionKey,
+                  error: message,
+                  metadataJson: JSON.stringify({
+                    transport: 'openclaw-plugin',
+                    state: 'reply-persistence-failed',
+                  }),
+                },
+              });
+            } catch (transitionError) {
+              console.error('[NC] failed marking work item as failed', transitionError);
+            }
+          }
+          throw error;
+        }
       },
       onError: (err, info) => {
         console.error(`[NC] ${info.kind} reply failed`, err);
