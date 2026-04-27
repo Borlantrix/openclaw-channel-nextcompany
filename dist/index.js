@@ -2,7 +2,7 @@ import { execSync, spawn } from 'child_process';
 import { existsSync, readdirSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { createAccountListHelpers } from 'openclaw/plugin-sdk';
+import { createAccountListHelpers } from 'openclaw/plugin-sdk/account-helpers';
 import { NextCompanyWebSocketClient } from './websocket.js';
 const CHANNEL_ID = 'nextcompany';
 const CHANNEL_LABEL = 'NextCompany';
@@ -918,7 +918,7 @@ async function dispatchInboundContext(params) {
         envelope,
         body: inbound.rawBody,
     });
-    const resolvedSessionKey = route.sessionKey ?? inbound.sessionKey;
+    const resolvedSessionKey = route.sessionKey ?? inbound.sessionKey ?? inbound.peerId;
     if (inbound.workItemId) {
         await transitionAgentWorkItem({
             account,
@@ -1178,13 +1178,14 @@ const channelPlugin = {
                     const inbound = await resolveInboundContext(message, account);
                     if (!inbound || !channelRuntime)
                         return;
+                    const runtime = channelRuntime;
                     client.sendAvatarStatus('working');
                     await dispatchInboundContext({
                         cfg,
                         accountId,
                         account,
                         inbound,
-                        channelRuntime,
+                        channelRuntime: runtime,
                         client,
                     });
                 }

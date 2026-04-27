@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import type { ChannelPlugin, OpenClawConfig, OpenClawPluginApi } from 'openclaw/plugin-sdk';
-import { createAccountListHelpers } from 'openclaw/plugin-sdk';
+import { createAccountListHelpers } from 'openclaw/plugin-sdk/account-helpers';
 import type {
   InboundMessage,
   NextCompanyAccountConfig,
@@ -26,7 +26,33 @@ const { listAccountIds, resolveDefaultAccountId } = createAccountListHelpers(CHA
 type StartAccountContext = Parameters<
   NonNullable<NonNullable<ChannelPlugin<NextCompanyAccountConfig>['gateway']>['startAccount']>
 >[0];
-type ChannelRuntime = NonNullable<StartAccountContext['channelRuntime']>;
+type ChannelRuntime = {
+  routing: {
+    resolveAgentRoute: (params: Record<string, unknown>) => {
+      agentId?: string;
+      sessionKey?: string;
+      accountId?: string;
+    };
+  };
+  session: {
+    resolveStorePath: (store: unknown, options: { agentId?: string }) => string;
+    readSessionUpdatedAt: (params: { storePath: string; sessionKey?: string }) => number | undefined;
+    recordInboundSession: (params: {
+      storePath: string;
+      sessionKey?: string;
+      ctx: Record<string, unknown>;
+      onRecordError?: (err: unknown) => void;
+    }) => Promise<void>;
+  };
+  reply: {
+    resolveEnvelopeFormatOptions: (cfg: OpenClawConfig) => unknown;
+    formatAgentEnvelope: (params: Record<string, unknown>) => string;
+    finalizeInboundContext: (ctx: Record<string, unknown>) => Record<string, unknown> & {
+      SessionKey?: string;
+    };
+    dispatchReplyWithBufferedBlockDispatcher: (params: Record<string, unknown>) => Promise<void>;
+  };
+};
 
 interface RoutedInboundContext {
   rawBody: string;
@@ -1119,7 +1145,7 @@ async function dispatchInboundContext(params: {
     body: inbound.rawBody,
   });
 
-  const resolvedSessionKey = route.sessionKey ?? inbound.sessionKey;
+  const resolvedSessionKey = route.sessionKey ?? inbound.sessionKey ?? inbound.peerId;
 
   if (inbound.workItemId) {
     await transitionAgentWorkItem({
@@ -1251,7 +1277,7 @@ async function dispatchInboundContext(params: {
     ctx: ctxPayload,
     cfg,
     dispatcherOptions: {
-      deliver: async (payload) => {
+      deliver: async (payload: string | { text?: string; replyToId?: string }) => {
         const text = typeof payload === 'string'
           ? payload
           : (payload as { text?: string; replyToId?: string }).text ?? '';
@@ -1314,7 +1340,7 @@ async function dispatchInboundContext(params: {
           throw error;
         }
       },
-      onError: (err, info) => {
+      onError: (err: unknown, info: { kind?: string }) => {
         console.error(`[NC] ${info.kind} reply failed`, err);
       },
     },
@@ -1394,13 +1420,14 @@ const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
           const inbound = await resolveInboundContext(message, account);
           if (!inbound || !channelRuntime) return;
 
+          const runtime = channelRuntime as unknown as ChannelRuntime;
           client.sendAvatarStatus('working');
           await dispatchInboundContext({
             cfg,
             accountId,
             account,
             inbound,
-            channelRuntime,
+            channelRuntime: runtime,
             client,
           });
         } catch (err) {
