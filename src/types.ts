@@ -45,23 +45,84 @@ export interface NextCompanyDirectMessage {
 
 export interface NextCompanyNotificationMessage {
   type: 'notification';
-  kind: string;
-  sourceType: string;
-  sourceId: string;
-  sourceTitle: string;
-  projectId: string;
+  workItemId?: string;
+  WorkItemId?: string;
+  kind?: string;
+  Kind?: string;
+  sourceType?: string;
+  SourceType?: string;
+  sourceId?: string;
+  SourceId?: string;
+  sourceTitle?: string;
+  SourceTitle?: string;
+  projectId?: string;
+  ProjectId?: string;
   excerpt?: string;
+  Excerpt?: string;
   actorName?: string;
+  ActorName?: string;
   actorAvatarUrl?: string;
+  ActorAvatarUrl?: string;
   actionUrl?: string;
+  ActionUrl?: string;
   projectName?: string;
+  ProjectName?: string;
   id?: string;
+  Id?: string;
   isRead?: boolean;
+  IsRead?: boolean;
   createdAt?: string;
+  CreatedAt?: string;
   tableId?: string;
+  TableId?: string;
   commentId?: string;
+  CommentId?: string;
   triggerKind?: string;
+  TriggerKind?: string;
+  entityKind?: string;
+  EntityKind?: string;
+  entityId?: string;
+  EntityId?: string;
+  threadId?: string;
+  ThreadId?: string;
+  conversationId?: string;
+  ConversationId?: string;
+  mailboxId?: string;
+  MailboxId?: string;
+  occurrenceId?: string;
+  OccurrenceId?: string;
+  checkInId?: string;
+  CheckInId?: string;
   metadata?: NextCompanyNotificationMetadata;
+  Metadata?: NextCompanyNotificationMetadata;
+}
+
+export interface NextCompanyAgentWakeMessage {
+  type: 'agent_wake';
+  workItemId?: string;
+  WorkItemId?: string;
+  agentId?: string;
+  AgentId?: string;
+  organizationId?: string;
+  OrganizationId?: string;
+  projectId?: string;
+  ProjectId?: string;
+  notificationId?: string;
+  NotificationId?: string;
+  wakeReason?: string;
+  WakeReason?: string;
+  sourceType?: string;
+  SourceType?: string;
+  sourceId?: string;
+  SourceId?: string;
+  sessionKey?: string;
+  SessionKey?: string;
+  correlationKey?: string;
+  CorrelationKey?: string;
+  createdAt?: string;
+  CreatedAt?: string;
+  metadata?: NextCompanyNotificationMetadata;
+  Metadata?: NextCompanyNotificationMetadata;
 }
 
 export interface NextCompanyReadFileMessage {
@@ -103,11 +164,74 @@ export interface NextCompanyPongMessage {
   type: 'pong';
 }
 
+export interface NextCompanyAgentInboxEvent {
+  id: string;
+  fromStatus?: string | null;
+  toStatus: string;
+  eventKind: string;
+  occurredAt: string;
+  actorType: string;
+  actorId?: string | null;
+  metadata?: unknown;
+}
+
+export interface NextCompanyAgentWorkItemPayload {
+  kind?: string;
+  cardId?: string;
+  repositorySlug?: string;
+  baseBranch?: string | null;
+  branchPrefix?: string | null;
+  title?: string | null;
+  bodyTemplate?: string | null;
+  notificationKind?: string;
+  sourceTitle?: string;
+  excerpt?: string | null;
+  actorName?: string;
+  actorAvatarUrl?: string | null;
+  actionUrl?: string;
+  tableId?: string | null;
+  entityKind?: string | null;
+  entityId?: string;
+  threadId?: string | null;
+  conversationId?: string | null;
+  mailboxId?: string | null;
+  occurrenceId?: string | null;
+  checkInId?: string | null;
+}
+
+export interface NextCompanyAgentWorkItem {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  agentId: string;
+  notificationId?: string | null;
+  sourceType: string;
+  sourceId: string;
+  commentId?: string | null;
+  triggerKind: string;
+  status: string;
+  payload?: NextCompanyAgentWorkItemPayload | null;
+  createdAt: string;
+  wakeSentAt?: string | null;
+  deliveredAt?: string | null;
+  ackedAt?: string | null;
+  claimedAt?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  failedAt?: string | null;
+  attemptCount: number;
+  lastError?: string | null;
+  sessionKey?: string | null;
+  correlationKey?: string | null;
+  events?: NextCompanyAgentInboxEvent[];
+}
+
 export type InboundMessage =
   | NextCompanyConnectedMessage
   | NextCompanyIdentifiedMessage
   | NextCompanyDirectMessage
   | NextCompanyNotificationMessage
+  | NextCompanyAgentWakeMessage
   | NextCompanyReadFileMessage
   | NextCompanyModelQueryMessage
   | NextCompanyCheckInMessage

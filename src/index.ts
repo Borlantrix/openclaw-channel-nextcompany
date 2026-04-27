@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { existsSync, readdirSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -7,6 +7,9 @@ import { createAccountListHelpers } from 'openclaw/plugin-sdk';
 import type {
   InboundMessage,
   NextCompanyAccountConfig,
+  NextCompanyAgentWakeMessage,
+  NextCompanyAgentWorkItem,
+  NextCompanyAgentWorkItemPayload,
   NextCompanyCheckInMessage,
   NextCompanyDirectMessage,
   NextCompanyMailboxEmailMessage,
@@ -39,6 +42,32 @@ interface RoutedInboundContext {
   senderId?: string;
   senderUsername?: string;
   untrustedContext?: string[];
+  workItemId?: string;
+  sessionKey?: string;
+  workItem?: NextCompanyAgentWorkItem;
+}
+
+interface NextCompanyTransitionBody {
+  metadataJson?: string;
+  sessionKey?: string;
+  error?: string;
+  occurredAt?: string;
+}
+
+interface GithubPrExecutorConfig {
+  enabled?: boolean;
+  mode?: 'codex' | 'command';
+  command?: string;
+  args?: string[];
+  timeoutMs?: number;
+  repoMap?: Record<string, string>;
+}
+
+interface GithubPrExecutionResult {
+  prUrl: string;
+  prNumber: number;
+  branchName?: string;
+  changedFilesCount?: number;
 }
 
 function getAccounts(cfg: OpenClawConfig): Record<string, NextCompanyAccountConfig> {
@@ -58,6 +87,13 @@ function getAccounts(cfg: OpenClawConfig): Record<string, NextCompanyAccountConf
     };
   }
   return result;
+}
+
+function getPluginConfig(cfg: OpenClawConfig): Record<string, unknown> {
+  const plugins = (cfg as Record<string, unknown>)['plugins'] as Record<string, unknown> | undefined;
+  const entries = plugins?.['entries'] as Record<string, unknown> | undefined;
+  const pluginEntry = entries?.['openclaw-channel-nextcompany'] as Record<string, unknown> | undefined;
+  return (pluginEntry?.['config'] as Record<string, unknown> | undefined) ?? {};
 }
 
 function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): NextCompanyAccountConfig {
@@ -210,6 +246,153 @@ function normalizeBaseUrl(url: string): string {
     .replace(/\/ws\/agents\/?$/, '');
 }
 
+function buildNextCompanyApiUrl(account: NextCompanyAccountConfig, path: string): string {
+  const baseUrl = normalizeBaseUrl(account.url).replace(/\/+$/, '');
+  return `${baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function serializeTransitionBody(body: NextCompanyTransitionBody): string | undefined {
+  const payload = Object.fromEntries(
+    Object.entries({
+      metadataJson: body.metadataJson,
+      sessionKey: body.sessionKey,
+      error: body.error,
+      occurredAt: body.occurredAt,
+    }).filter(([, value]) => value !== undefined),
+  );
+  return Object.keys(payload).length > 0 ? JSON.stringify(payload) : undefined;
+}
+
+function getGithubPrExecutorConfig(cfg: OpenClawConfig): GithubPrExecutorConfig {
+  const pluginConfig = getPluginConfig(cfg);
+  const raw = pluginConfig['githubPrExecutor'] as Record<string, unknown> | undefined;
+  const repoMapRaw = raw?.['repoMap'] as Record<string, unknown> | undefined;
+  const repoMap = repoMapRaw
+    ? Object.fromEntries(Object.entries(repoMapRaw).map(([key, value]) => [key, String(value)]))
+    : undefined;
+
+  return {
+    enabled: raw?.['enabled'] === undefined ? true : Boolean(raw['enabled']),
+    mode: raw?.['mode'] === 'command' ? 'command' : 'codex',
+    command: raw?.['command'] ? String(raw['command']) : undefined,
+    args: Array.isArray(raw?.['args']) ? raw?.['args'].map((v) => String(v)) : undefined,
+    timeoutMs: typeof raw?.['timeoutMs'] === 'number' ? (raw['timeoutMs'] as number) : 20 * 60_000,
+    repoMap,
+  };
+}
+
+function resolveRepoPath(repoSlug: string, cfg: OpenClawConfig): string {
+  const executor = getGithubPrExecutorConfig(cfg);
+  const mapped = executor.repoMap?.[repoSlug];
+  if (mapped) return mapped;
+
+  const repoName = repoSlug.split('/').pop() ?? repoSlug;
+  return join(homedir(), '.openclaw', 'workspace', 'repos', repoName);
+}
+
+function commandExists(command: string): boolean {
+  try {
+    execSync(`command -v ${command} >/dev/null 2>&1`, { timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseJsonObject(text: string): Record<string, unknown> {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error('Executor returned empty output.');
+
+  try {
+    return JSON.parse(trimmed) as Record<string, unknown>;
+  } catch {
+    const match = trimmed.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error(`Executor output is not valid JSON: ${trimmed.slice(0, 500)}`);
+    return JSON.parse(match[0]) as Record<string, unknown>;
+  }
+}
+
+async function runProcessJson(params: {
+  command: string;
+  args: string[];
+  cwd: string;
+  input: string;
+  timeoutMs: number;
+}): Promise<Record<string, unknown>> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(params.command, params.args, {
+      cwd: params.cwd,
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, params.timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      if (timedOut) {
+        reject(new Error(`Executor timed out after ${params.timeoutMs}ms.`));
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(`Executor exited with code ${code}. ${stderr || stdout}`.trim()));
+        return;
+      }
+
+      try {
+        resolve(parseJsonObject(stdout));
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    child.stdin.write(params.input);
+    child.stdin.end();
+  });
+}
+
+async function nextCompanyApiRequest<T>(params: {
+  account: NextCompanyAccountConfig;
+  path: string;
+  method?: 'GET' | 'POST';
+  body?: string;
+}): Promise<T> {
+  const response = await fetch(buildNextCompanyApiUrl(params.account, params.path), {
+    method: params.method ?? 'GET',
+    headers: {
+      'X-Api-Key': params.account.apiKey,
+      Accept: 'application/json',
+      ...(params.body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: params.body,
+  });
+
+  if (!response.ok) {
+    const responseText = await response.text().catch(() => '');
+    throw new Error(`NextCompany API ${params.method ?? 'GET'} ${params.path} failed: ${response.status}${responseText ? ` ${responseText}` : ''}`);
+  }
+
+  if (response.status === 204) return undefined as T;
+  return await response.json() as T;
+}
+
 function normalizeToken(value: string | undefined, fallback = 'unknown'): string {
   const normalized = (value ?? '')
     .trim()
@@ -236,12 +419,34 @@ function joinContextLines(lines: Array<string | undefined>): string[] {
     .filter((line): line is string => Boolean(line));
 }
 
-function formatNotificationSummary(message: NextCompanyNotificationMessage): string {
-  const sourceType = normalizeLabel(message.sourceType, 'work item');
-  const title = normalizeLabel(message.sourceTitle, 'Untitled');
-  const actor = message.actorName?.trim();
+function workItemPayloadField<T = string>(payload: NextCompanyAgentWorkItemPayload | undefined | null, key: keyof NextCompanyAgentWorkItemPayload): T | undefined {
+  return payload?.[key] as T | undefined;
+}
 
-  switch (message.kind) {
+function notificationField<T = string>(message: NextCompanyNotificationMessage, camel: keyof NextCompanyNotificationMessage, pascal?: keyof NextCompanyNotificationMessage): T | undefined {
+  return (message[camel] as T | undefined)
+    ?? (pascal ? (message[pascal] as T | undefined) : undefined);
+}
+
+function wakeField<T = string>(message: NextCompanyAgentWakeMessage, camel: keyof NextCompanyAgentWakeMessage, pascal?: keyof NextCompanyAgentWakeMessage): T | undefined {
+  return (message[camel] as T | undefined)
+    ?? (pascal ? (message[pascal] as T | undefined) : undefined);
+}
+
+function resolveReferencedWorkItemId(message: NextCompanyNotificationMessage | NextCompanyAgentWakeMessage): string | undefined {
+  if (message.type === 'agent_wake') {
+    return wakeField(message, 'workItemId', 'WorkItemId')?.trim();
+  }
+  return notificationField(message, 'workItemId', 'WorkItemId')?.trim();
+}
+
+function formatNotificationSummary(message: NextCompanyNotificationMessage): string {
+  const sourceType = normalizeLabel(notificationField(message, 'sourceType', 'SourceType'), 'work item');
+  const title = normalizeLabel(notificationField(message, 'sourceTitle', 'SourceTitle'), 'Untitled');
+  const actor = notificationField(message, 'actorName', 'ActorName')?.trim();
+  const kind = notificationField(message, 'kind', 'Kind') ?? 'Notification';
+
+  switch (kind) {
     case 'Assigned':
       return actor
         ? `${actor} assigned you to ${sourceType} "${title}".`
@@ -260,17 +465,25 @@ function formatNotificationSummary(message: NextCompanyNotificationMessage): str
         : `New comment on ${sourceType} "${title}".`;
     default:
       return actor
-        ? `${actor} triggered ${message.kind} on ${sourceType} "${title}".`
-        : `${message.kind} on ${sourceType} "${title}".`;
+        ? `${actor} triggered ${kind} on ${sourceType} "${title}".`
+        : `${kind} on ${sourceType} "${title}".`;
   }
 }
 
 function resolveNotificationMetadata(message: NextCompanyNotificationMessage): NextCompanyNotificationMetadata {
+  const metadata = message.metadata ?? message.Metadata ?? {};
   return {
-    ...(message.metadata ?? {}),
-    tableId: message.tableId ?? message.metadata?.tableId,
-    commentId: message.commentId ?? message.metadata?.commentId,
-    triggerKind: message.triggerKind ?? message.metadata?.triggerKind,
+    ...metadata,
+    tableId: notificationField(message, 'tableId', 'TableId') ?? metadata.tableId,
+    commentId: notificationField(message, 'commentId', 'CommentId') ?? metadata.commentId,
+    triggerKind: notificationField(message, 'triggerKind', 'TriggerKind') ?? metadata.triggerKind,
+    entityKind: notificationField(message, 'entityKind', 'EntityKind') ?? metadata.entityKind,
+    entityId: notificationField(message, 'entityId', 'EntityId') ?? metadata.entityId,
+    threadId: notificationField(message, 'threadId', 'ThreadId') ?? metadata.threadId,
+    conversationId: notificationField(message, 'conversationId', 'ConversationId') ?? metadata.conversationId,
+    mailboxId: notificationField(message, 'mailboxId', 'MailboxId') ?? metadata.mailboxId,
+    occurrenceId: notificationField(message, 'occurrenceId', 'OccurrenceId') ?? metadata.occurrenceId,
+    checkInId: notificationField(message, 'checkInId', 'CheckInId') ?? metadata.checkInId,
   };
 }
 
@@ -280,60 +493,192 @@ function resolveNotificationEntityUrl(params: {
   metadata: NextCompanyNotificationMetadata;
 }): string | undefined {
   const { baseUrl, message, metadata } = params;
-  if (message.actionUrl?.trim()) {
-    if (/^https?:\/\//i.test(message.actionUrl)) return message.actionUrl;
-    return `${baseUrl}${message.actionUrl.startsWith('/') ? '' : '/'}${message.actionUrl}`;
+  const actionUrl = notificationField(message, 'actionUrl', 'ActionUrl');
+  const projectId = notificationField(message, 'projectId', 'ProjectId');
+  const sourceType = notificationField(message, 'sourceType', 'SourceType');
+  const sourceId = notificationField(message, 'sourceId', 'SourceId');
+
+  if (actionUrl?.trim()) {
+    if (/^https?:\/\//i.test(actionUrl)) return actionUrl;
+    return `${baseUrl}${actionUrl.startsWith('/') ? '' : '/'}${actionUrl}`;
   }
 
-  switch (normalizeToken(message.sourceType)) {
+  switch (normalizeToken(sourceType)) {
     case 'card':
-      if (message.projectId && metadata.tableId) {
-        return `${baseUrl}/projects/${message.projectId}/boards/${metadata.tableId}/cards/${message.sourceId}`;
+      if (projectId && metadata.tableId) {
+        return `${baseUrl}/projects/${projectId}/boards/${metadata.tableId}/cards/${sourceId}`;
       }
       return undefined;
     case 'task':
-      return `${baseUrl}/projects/${message.projectId}/tasks/${message.sourceId}`;
+      return projectId && sourceId ? `${baseUrl}/projects/${projectId}/tasks/${sourceId}` : undefined;
     case 'post':
-      return `${baseUrl}/projects/${message.projectId}/posts/${message.sourceId}`;
+      return projectId && sourceId ? `${baseUrl}/projects/${projectId}/posts/${sourceId}` : undefined;
     default:
       return undefined;
   }
 }
 
-function buildNotificationContext(message: NextCompanyNotificationMessage, baseUrl: string): RoutedInboundContext {
-  const metadata = resolveNotificationMetadata(message);
-  const entityType = normalizeToken(metadata.entityKind ?? message.sourceType, 'notification');
-  const entityId = normalizeToken(metadata.entityId ?? message.sourceId ?? message.id, 'unknown');
-  const projectId = normalizeToken(message.projectId, 'project');
+function resolveWorkItemEntityUrl(params: {
+  baseUrl: string;
+  workItem: NextCompanyAgentWorkItem;
+}): string | undefined {
+  const { baseUrl, workItem } = params;
+  const actionUrl = workItemPayloadField(workItem.payload, 'actionUrl');
+  const tableId = workItemPayloadField(workItem.payload, 'tableId');
+
+  if (actionUrl?.trim()) {
+    if (/^https?:\/\//i.test(actionUrl)) return actionUrl;
+    return `${baseUrl}${actionUrl.startsWith('/') ? '' : '/'}${actionUrl}`;
+  }
+
+  switch (normalizeToken(workItem.sourceType)) {
+    case 'card':
+      return workItem.projectId && tableId
+        ? `${baseUrl}/projects/${workItem.projectId}/boards/${tableId}/cards/${workItem.sourceId}`
+        : undefined;
+    case 'task':
+      return workItem.projectId && workItem.sourceId
+        ? `${baseUrl}/projects/${workItem.projectId}/tasks/${workItem.sourceId}`
+        : undefined;
+    case 'post':
+      return workItem.projectId && workItem.sourceId
+        ? `${baseUrl}/projects/${workItem.projectId}/posts/${workItem.sourceId}`
+        : undefined;
+    default:
+      return undefined;
+  }
+}
+
+function buildWorkItemSummary(workItem: NextCompanyAgentWorkItem): string {
+  const title = normalizeLabel(workItemPayloadField(workItem.payload, 'sourceTitle'), 'Untitled');
+  const sourceType = normalizeLabel(workItem.sourceType, 'work item');
+  const actor = workItemPayloadField(workItem.payload, 'actorName')?.trim();
+  const triggerKind = normalizeLabel(workItem.triggerKind, 'Notification');
+
+  switch (triggerKind) {
+    case 'Assigned':
+      return actor
+        ? `${actor} assigned you to ${sourceType} "${title}".`
+        : `You were assigned to ${sourceType} "${title}".`;
+    case 'Mention':
+      return actor
+        ? `${actor} mentioned you in ${sourceType} "${title}".`
+        : `You were mentioned in ${sourceType} "${title}".`;
+    case 'NewPost':
+      return actor
+        ? `${actor} published a new post "${title}".`
+        : `New post "${title}".`;
+    case 'Comment':
+      return actor
+        ? `${actor} commented on ${sourceType} "${title}".`
+        : `New comment on ${sourceType} "${title}".`;
+    default:
+      return actor
+        ? `${actor} triggered ${triggerKind} on ${sourceType} "${title}".`
+        : `${triggerKind} on ${sourceType} "${title}".`;
+  }
+}
+
+function buildWorkItemContext(workItem: NextCompanyAgentWorkItem, account: NextCompanyAccountConfig): RoutedInboundContext {
+  const payload = workItem.payload;
+  const sourceTitle = workItemPayloadField(payload, 'sourceTitle');
+  const actorName = workItemPayloadField(payload, 'actorName');
+  const excerpt = workItemPayloadField(payload, 'excerpt');
+  const entityType = normalizeToken(workItemPayloadField(payload, 'entityKind') ?? workItem.sourceType, 'notification');
+  const entityId = normalizeToken(workItemPayloadField(payload, 'entityId') ?? workItem.sourceId ?? workItem.id, 'unknown');
+  const projectId = normalizeToken(workItem.projectId, 'project');
+  const actionUrl = resolveWorkItemEntityUrl({ baseUrl: normalizeBaseUrl(account.url), workItem });
   const peerId = `${entityType}:${projectId}:${entityId}`;
-  const actionUrl = resolveNotificationEntityUrl({ baseUrl, message, metadata });
   const rawBody = [
-    formatNotificationSummary(message),
-    message.excerpt?.trim() ? `Excerpt:\n${message.excerpt.trim()}` : undefined,
+    buildWorkItemSummary(workItem),
+    excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join('\n\n');
 
   return {
     rawBody,
-    from: message.actorName?.trim()
-      ? `nextcompany:actor:${normalizeToken(message.actorName)}`
+    from: actorName?.trim()
+      ? `nextcompany:actor:${normalizeToken(actorName)}`
       : 'nextcompany:system',
-    fromLabel: normalizeLabel(message.actorName, CHANNEL_LABEL),
+    fromLabel: normalizeLabel(actorName, CHANNEL_LABEL),
     to: `nextcompany:${peerId}`,
     peerId,
-    conversationLabel: `${normalizeLabel(message.sourceType, 'Work')}: ${normalizeLabel(message.sourceTitle, 'Untitled')}`,
-    timestamp: toTimestamp(message.createdAt),
-    messageSid: metadata.commentId ?? message.id,
-    replyToId: metadata.commentId ?? message.id,
-    senderName: normalizeLabel(message.actorName, CHANNEL_LABEL),
-    senderId: message.actorName?.trim() ? normalizeToken(message.actorName) : 'system',
+    conversationLabel: `${normalizeLabel(workItem.sourceType, 'Work')}: ${normalizeLabel(sourceTitle, 'Untitled')}`,
+    timestamp: toTimestamp(workItem.createdAt),
+    messageSid: workItem.commentId ?? workItem.notificationId ?? workItem.id,
+    replyToId: workItem.commentId ?? workItem.notificationId ?? workItem.id,
+    senderName: normalizeLabel(actorName, CHANNEL_LABEL),
+    senderId: actorName?.trim() ? normalizeToken(actorName) : 'system',
     untrustedContext: joinContextLines([
-      `Notification kind: ${message.kind}`,
+      `Work item id: ${workItem.id}`,
+      `Status: ${workItem.status}`,
+      `Trigger kind: ${workItem.triggerKind}`,
+      `Entity type: ${normalizeLabel(workItem.sourceType, 'unknown')}`,
+      `Entity id: ${workItem.sourceId}`,
+      `Project id: ${workItem.projectId}`,
+      workItem.commentId ? `Comment id: ${workItem.commentId}` : undefined,
+      workItem.notificationId ? `Notification id: ${workItem.notificationId}` : undefined,
+      workItem.correlationKey ? `Correlation key: ${workItem.correlationKey}` : undefined,
+      workItem.sessionKey ? `Existing session key: ${workItem.sessionKey}` : undefined,
+      workItemPayloadField(payload, 'tableId') ? `Table id: ${workItemPayloadField(payload, 'tableId')}` : undefined,
+      workItemPayloadField(payload, 'threadId') ? `Thread id: ${workItemPayloadField(payload, 'threadId')}` : undefined,
+      workItemPayloadField(payload, 'conversationId') ? `Conversation id: ${workItemPayloadField(payload, 'conversationId')}` : undefined,
+      workItemPayloadField(payload, 'mailboxId') ? `Mailbox id: ${workItemPayloadField(payload, 'mailboxId')}` : undefined,
+      workItemPayloadField(payload, 'occurrenceId') ? `Occurrence id: ${workItemPayloadField(payload, 'occurrenceId')}` : undefined,
+      workItemPayloadField(payload, 'checkInId') ? `Check-in id: ${workItemPayloadField(payload, 'checkInId')}` : undefined,
+      actionUrl ? `Open in NextCompany: ${actionUrl}` : undefined,
+    ]),
+    workItemId: workItem.id,
+    sessionKey: workItem.sessionKey ?? undefined,
+    workItem,
+  };
+}
+
+function buildNotificationContext(message: NextCompanyNotificationMessage, baseUrl: string): RoutedInboundContext {
+  const metadata = resolveNotificationMetadata(message);
+  const sourceType = notificationField(message, 'sourceType', 'SourceType');
+  const sourceId = notificationField(message, 'sourceId', 'SourceId');
+  const sourceTitle = notificationField(message, 'sourceTitle', 'SourceTitle');
+  const projectIdRaw = notificationField(message, 'projectId', 'ProjectId');
+  const messageId = notificationField(message, 'id', 'Id');
+  const kind = notificationField(message, 'kind', 'Kind');
+  const actorName = notificationField(message, 'actorName', 'ActorName');
+  const projectName = notificationField(message, 'projectName', 'ProjectName');
+  const excerpt = notificationField(message, 'excerpt', 'Excerpt');
+  const createdAt = notificationField(message, 'createdAt', 'CreatedAt');
+  const entityType = normalizeToken(metadata.entityKind ?? sourceType, 'notification');
+  const entityId = normalizeToken(metadata.entityId ?? sourceId ?? messageId, 'unknown');
+  const projectId = normalizeToken(projectIdRaw, 'project');
+  const peerId = `${entityType}:${projectId}:${entityId}`;
+  const actionUrl = resolveNotificationEntityUrl({ baseUrl, message, metadata });
+  const rawBody = [
+    formatNotificationSummary(message),
+    excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n\n');
+
+  return {
+    rawBody,
+    from: actorName?.trim()
+      ? `nextcompany:actor:${normalizeToken(actorName)}`
+      : 'nextcompany:system',
+    fromLabel: normalizeLabel(actorName, CHANNEL_LABEL),
+    to: `nextcompany:${peerId}`,
+    peerId,
+    conversationLabel: `${normalizeLabel(sourceType, 'Work')}: ${normalizeLabel(sourceTitle, 'Untitled')}`,
+    timestamp: toTimestamp(createdAt),
+    messageSid: metadata.commentId ?? messageId,
+    replyToId: metadata.commentId ?? messageId,
+    senderName: normalizeLabel(actorName, CHANNEL_LABEL),
+    senderId: actorName?.trim() ? normalizeToken(actorName) : 'system',
+    untrustedContext: joinContextLines([
+      `Notification kind: ${kind}`,
       metadata.triggerKind ? `Trigger kind: ${metadata.triggerKind}` : undefined,
-      `Entity type: ${normalizeLabel(message.sourceType, 'unknown')}`,
-      `Entity id: ${message.sourceId}`,
-      message.projectName ? `Project: ${message.projectName}` : `Project id: ${message.projectId}`,
+      `Entity type: ${normalizeLabel(sourceType, 'unknown')}`,
+      sourceId ? `Entity id: ${sourceId}` : undefined,
+      projectName ? `Project: ${projectName}` : `Project id: ${projectIdRaw}`,
       metadata.tableId ? `Table id: ${metadata.tableId}` : undefined,
       metadata.commentId ? `Comment id: ${metadata.commentId}` : undefined,
       actionUrl ? `Open in NextCompany: ${actionUrl}` : undefined,
@@ -436,14 +781,317 @@ function buildMailboxContext(message: NextCompanyMailboxEmailMessage): RoutedInb
   };
 }
 
+async function fetchAgentWorkItem(account: NextCompanyAccountConfig, workItemId: string): Promise<NextCompanyAgentWorkItem> {
+  return await nextCompanyApiRequest<NextCompanyAgentWorkItem>({
+    account,
+    path: `/api/agents/me/inbox/${workItemId}`,
+  });
+}
+
+async function transitionAgentWorkItem(params: {
+  account: NextCompanyAccountConfig;
+  workItemId: string;
+  action: 'delivered' | 'ack' | 'claim' | 'start' | 'complete' | 'fail';
+  body?: NextCompanyTransitionBody;
+}): Promise<NextCompanyAgentWorkItem> {
+  return await nextCompanyApiRequest<NextCompanyAgentWorkItem>({
+    account: params.account,
+    path: `/api/agent-work-items/${params.workItemId}/${params.action}`,
+    method: 'POST',
+    body: serializeTransitionBody(params.body ?? {}),
+  });
+}
+
+interface NextCompanyProjectTask {
+  id: string;
+  taskListId: string;
+  projectId: string;
+  isCompleted: boolean;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function plainTextToHtml(value: string): string {
+  const normalized = value.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return '';
+
+  return normalized
+    .split(/\n\s*\n/)
+    .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, '<br/>')}</p>`)
+    .join('');
+}
+
+function resolveTaskRouteFromWorkItem(workItem: NextCompanyAgentWorkItem): { projectId: string; listId: string; taskId: string } | undefined {
+  let projectId = workItem.projectId?.trim();
+  let taskId = workItem.sourceId?.trim();
+  let listId: string | undefined;
+  const actionUrl = workItemPayloadField(workItem.payload, 'actionUrl');
+
+  if (actionUrl?.trim()) {
+    try {
+      const pathname = new URL(actionUrl, 'https://nextcompany.invalid').pathname;
+      const parts = pathname.split('/').filter(Boolean);
+      if (parts[0] === 'projects' && parts[2] === 'tasks') {
+        projectId = projectId ?? parts[1];
+        if (parts[4]) {
+          listId = parts[3];
+          taskId = taskId ?? parts[4];
+        }
+      }
+    } catch {
+      // Ignore malformed URLs and fall back to work-item fields.
+    }
+  }
+
+  if (!projectId || !taskId || !listId) return undefined;
+  return { projectId, listId, taskId };
+}
+
+async function fetchTask(account: NextCompanyAccountConfig, projectId: string, listId: string, taskId: string): Promise<NextCompanyProjectTask> {
+  return await nextCompanyApiRequest<NextCompanyProjectTask>({
+    account,
+    path: `/api/projects/${projectId}/task-lists/${listId}/tasks/${taskId}`,
+  });
+}
+
+async function createTaskComment(params: {
+  account: NextCompanyAccountConfig;
+  projectId: string;
+  taskId: string;
+  text: string;
+}): Promise<void> {
+  const body = plainTextToHtml(params.text);
+  if (!body.trim()) return;
+
+  await nextCompanyApiRequest({
+    account: params.account,
+    path: `/api/projects/${params.projectId}/tasks/${params.taskId}/comments`,
+    method: 'POST',
+    body: JSON.stringify({ body }),
+  });
+}
+
+async function completeTaskIfNeeded(params: {
+  account: NextCompanyAccountConfig;
+  projectId: string;
+  listId: string;
+  taskId: string;
+}): Promise<void> {
+  const task = await fetchTask(params.account, params.projectId, params.listId, params.taskId);
+  if (task.isCompleted) return;
+
+  await nextCompanyApiRequest({
+    account: params.account,
+    path: `/api/projects/${params.projectId}/task-lists/${params.listId}/tasks/${params.taskId}/toggle`,
+    method: 'POST',
+  });
+}
+
+async function persistTaskReplyAndComplete(params: {
+  account: NextCompanyAccountConfig;
+  workItem: NextCompanyAgentWorkItem;
+  text: string;
+}): Promise<{ projectId: string; listId: string; taskId: string }> {
+  const taskRoute = resolveTaskRouteFromWorkItem(params.workItem);
+  if (!taskRoute) {
+    throw new Error(`Unable to resolve task route for work item ${params.workItem.id}.`);
+  }
+
+  await createTaskComment({
+    account: params.account,
+    projectId: taskRoute.projectId,
+    taskId: taskRoute.taskId,
+    text: params.text,
+  });
+
+  await completeTaskIfNeeded({
+    account: params.account,
+    projectId: taskRoute.projectId,
+    listId: taskRoute.listId,
+    taskId: taskRoute.taskId,
+  });
+
+  return taskRoute;
+}
+
+async function fetchExecutionContext(account: NextCompanyAccountConfig, cardId: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    return await nextCompanyApiRequest<Record<string, unknown>>({
+      account,
+      path: `/api/agents/me/execution-context?cardId=${encodeURIComponent(cardId)}`,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function buildCodexGithubPrPrompt(params: {
+  workItem: NextCompanyAgentWorkItem;
+  repoPath: string;
+  executionContext?: Record<string, unknown>;
+}): string {
+  const payload = params.workItem.payload ?? {};
+  const card = params.executionContext?.['card'] as Record<string, unknown> | undefined;
+  const currentStage = params.executionContext?.['currentStage'] as Record<string, unknown> | undefined;
+  const board = params.executionContext?.['board'] as Record<string, unknown> | undefined;
+
+  const cardTitle = String(card?.['title'] ?? payload.title ?? 'Untitled');
+  const cardDescription = typeof card?.['description'] === 'string' ? card['description'] : '';
+  const stageInstructions = typeof currentStage?.['agentInstructions'] === 'string' ? currentStage['agentInstructions'] : '';
+  const boardPrompt = typeof board?.['agentPrompt'] === 'string' ? board['agentPrompt'] : '';
+
+  return [
+    'You are executing a NextCompany github_pr work item.',
+    `Repository slug: ${payload.repositorySlug ?? 'unknown'}`,
+    `Local repository path: ${params.repoPath}`,
+    `Card id: ${payload.cardId ?? params.workItem.sourceId}`,
+    `Card title: ${cardTitle}`,
+    cardDescription ? `Card description:\n${cardDescription}` : undefined,
+    `Base branch: ${String(payload.baseBranch ?? 'main')}`,
+    payload.branchPrefix ? `Branch prefix: ${payload.branchPrefix}` : undefined,
+    payload.bodyTemplate ? `PR body template:\n${payload.bodyTemplate}` : undefined,
+    boardPrompt ? `Board prompt:\n${boardPrompt}` : undefined,
+    stageInstructions ? `Stage instructions:\n${stageInstructions}` : undefined,
+    '',
+    'Requirements:',
+    '- Make the requested change in the local repository.',
+    '- Use git and gh to create a real GitHub PR against the base branch.',
+    '- Run focused validation when relevant.',
+    '- Commit and push your branch.',
+    '- Output ONLY a single JSON object and no markdown.',
+    '- On success output: {"prUrl":"...","prNumber":123,"branchName":"...","changedFilesCount":4}',
+    '- On failure output: {"error":"clear reason"}',
+  ].filter(Boolean).join('\n');
+}
+
+async function executeGithubPrWorkItem(params: {
+  cfg: OpenClawConfig;
+  account: NextCompanyAccountConfig;
+  inbound: RoutedInboundContext;
+  sessionKey: string;
+}): Promise<GithubPrExecutionResult> {
+  const workItem = params.inbound.workItem;
+  if (!workItem) throw new Error('Missing work item context for github_pr execution.');
+
+  const payload = workItem.payload ?? {};
+  const repoSlug = payload.repositorySlug;
+  if (!repoSlug) throw new Error('github_pr payload is missing repositorySlug.');
+
+  const repoPath = resolveRepoPath(repoSlug, params.cfg);
+  if (!existsSync(repoPath)) throw new Error(`Local repository path not found for ${repoSlug}: ${repoPath}`);
+
+  const executor = getGithubPrExecutorConfig(params.cfg);
+  if (executor.enabled === false) {
+    throw new Error('github_pr executor is disabled in plugin configuration.');
+  }
+
+  const executionContext = payload.cardId ? await fetchExecutionContext(params.account, payload.cardId) : undefined;
+
+  let rawResult: Record<string, unknown>;
+  if (executor.mode === 'command' && executor.command) {
+    rawResult = await runProcessJson({
+      command: executor.command,
+      args: executor.args ?? [],
+      cwd: repoPath,
+      timeoutMs: executor.timeoutMs ?? 20 * 60_000,
+      input: JSON.stringify({
+        workItem,
+        sessionKey: params.sessionKey,
+        repoPath,
+        executionContext,
+      }),
+    });
+  } else {
+    if (!commandExists('codex')) {
+      throw new Error('github_pr executor is not configured and Codex CLI is unavailable.');
+    }
+
+    rawResult = await runProcessJson({
+      command: 'codex',
+      args: ['exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', buildCodexGithubPrPrompt({
+        workItem,
+        repoPath,
+        executionContext,
+      })],
+      cwd: repoPath,
+      timeoutMs: executor.timeoutMs ?? 20 * 60_000,
+      input: '',
+    });
+  }
+
+  if (typeof rawResult['error'] === 'string' && rawResult['error'].trim()) {
+    throw new Error(String(rawResult['error']).trim());
+  }
+
+  const prUrl = rawResult['prUrl'];
+  const prNumber = rawResult['prNumber'];
+  if (typeof prUrl !== 'string' || !prUrl.trim()) throw new Error('Executor did not return prUrl.');
+  if (typeof prNumber !== 'number' || prNumber <= 0) throw new Error('Executor did not return a valid prNumber.');
+
+  return {
+    prUrl: prUrl.trim(),
+    prNumber,
+    branchName: typeof rawResult['branchName'] === 'string' ? rawResult['branchName'] : undefined,
+    changedFilesCount: typeof rawResult['changedFilesCount'] === 'number' ? rawResult['changedFilesCount'] : undefined,
+  };
+}
+
+async function resolveInboundContext(message: InboundMessage, account: NextCompanyAccountConfig): Promise<RoutedInboundContext | undefined> {
+  const referencedWorkItemId = (
+    message.type === 'agent_wake' || message.type === 'notification'
+  ) ? resolveReferencedWorkItemId(message) : undefined;
+
+  if (referencedWorkItemId) {
+    if (message.type === 'agent_wake') {
+      await transitionAgentWorkItem({
+        account,
+        workItemId: referencedWorkItemId,
+        action: 'delivered',
+        body: {
+          metadataJson: JSON.stringify({
+            transport: 'websocket',
+            state: 'received-by-plugin',
+            messageType: message.type,
+            wakeReason: wakeField(message, 'wakeReason', 'WakeReason'),
+          }),
+        },
+      });
+    }
+
+    const workItem = await fetchAgentWorkItem(account, referencedWorkItemId);
+    return buildWorkItemContext(workItem, account);
+  }
+
+  switch (message.type) {
+    case 'message':
+      return buildMessageContext(message);
+    case 'notification':
+      return buildNotificationContext(message, normalizeBaseUrl(account.url));
+    case 'check_in':
+      return buildCheckInContext(message);
+    case 'mailbox_email':
+      return buildMailboxContext(message);
+    default:
+      return undefined;
+  }
+}
+
 async function dispatchInboundContext(params: {
   cfg: OpenClawConfig;
   accountId: string;
+  account: NextCompanyAccountConfig;
   inbound: RoutedInboundContext;
   channelRuntime: ChannelRuntime;
   client: NextCompanyWebSocketClient;
 }): Promise<void> {
-  const { cfg, accountId, inbound, channelRuntime, client } = params;
+  const { cfg, accountId, account, inbound, channelRuntime, client } = params;
   const route = channelRuntime.routing.resolveAgentRoute({
     cfg,
     channel: CHANNEL_ID,
@@ -471,6 +1119,98 @@ async function dispatchInboundContext(params: {
     body: inbound.rawBody,
   });
 
+  const resolvedSessionKey = route.sessionKey ?? inbound.sessionKey;
+
+  if (inbound.workItemId) {
+    await transitionAgentWorkItem({
+      account,
+      workItemId: inbound.workItemId,
+      action: 'ack',
+      body: {
+        sessionKey: resolvedSessionKey,
+        metadataJson: JSON.stringify({
+          transport: 'openclaw-plugin',
+          state: 'accepted-for-routing',
+          accountId,
+        }),
+      },
+    });
+
+    await transitionAgentWorkItem({
+      account,
+      workItemId: inbound.workItemId,
+      action: 'claim',
+      body: {
+        sessionKey: resolvedSessionKey,
+        metadataJson: JSON.stringify({
+          transport: 'openclaw-plugin',
+          state: 'dispatching-to-runtime',
+          accountId,
+          agentId: route.agentId,
+        }),
+      },
+    });
+
+    await transitionAgentWorkItem({
+      account,
+      workItemId: inbound.workItemId,
+      action: 'start',
+      body: {
+        sessionKey: resolvedSessionKey,
+        metadataJson: JSON.stringify({
+          transport: 'openclaw-plugin',
+          state: 'runtime-dispatch-started',
+          accountId,
+          agentId: route.agentId,
+        }),
+      },
+    });
+
+    if (inbound.workItem?.triggerKind === 'execute_github_pr') {
+      try {
+        const result = await executeGithubPrWorkItem({
+          cfg,
+          account,
+          inbound,
+          sessionKey: resolvedSessionKey,
+        });
+
+        await transitionAgentWorkItem({
+          account,
+          workItemId: inbound.workItemId,
+          action: 'complete',
+          body: {
+            sessionKey: resolvedSessionKey,
+            metadataJson: JSON.stringify({
+              transport: 'openclaw-plugin',
+              state: 'executor-completed',
+              prUrl: result.prUrl,
+              prNumber: result.prNumber,
+              branchName: result.branchName,
+              changedFilesCount: result.changedFilesCount,
+            }),
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await transitionAgentWorkItem({
+          account,
+          workItemId: inbound.workItemId,
+          action: 'fail',
+          body: {
+            sessionKey: resolvedSessionKey,
+            error: message,
+            metadataJson: JSON.stringify({
+              transport: 'openclaw-plugin',
+              state: 'executor-failed',
+            }),
+          },
+        });
+      }
+      return;
+    }
+  }
+
   const ctxPayload = channelRuntime.reply.finalizeInboundContext({
     Body: body,
     BodyForAgent: inbound.rawBody,
@@ -478,7 +1218,7 @@ async function dispatchInboundContext(params: {
     CommandBody: inbound.rawBody,
     From: inbound.from,
     To: inbound.to,
-    SessionKey: route.sessionKey,
+    SessionKey: resolvedSessionKey,
     AccountId: route.accountId,
     ChatType: 'direct',
     ConversationLabel: inbound.conversationLabel,
@@ -500,7 +1240,7 @@ async function dispatchInboundContext(params: {
 
   await channelRuntime.session.recordInboundSession({
     storePath,
-    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+    sessionKey: ctxPayload.SessionKey ?? resolvedSessionKey,
     ctx: ctxPayload,
     onRecordError: (err) => {
       console.error('[NC] failed updating session metadata', err);
@@ -516,32 +1256,69 @@ async function dispatchInboundContext(params: {
           ? payload
           : (payload as { text?: string; replyToId?: string }).text ?? '';
         if (!text.trim()) return;
-        client.send({
-          type: 'message',
-          text,
-          replyToMessageId: inbound.replyToId,
-        });
+
+        try {
+          if (inbound.workItem && normalizeToken(inbound.workItem.sourceType) === 'task') {
+            const taskRoute = await persistTaskReplyAndComplete({
+              account,
+              workItem: inbound.workItem,
+              text,
+            });
+
+            if (inbound.workItemId) {
+              await transitionAgentWorkItem({
+                account,
+                workItemId: inbound.workItemId,
+                action: 'complete',
+                body: {
+                  sessionKey: resolvedSessionKey,
+                  metadataJson: JSON.stringify({
+                    transport: 'openclaw-plugin',
+                    state: 'task-commented-and-completed',
+                    projectId: taskRoute.projectId,
+                    taskListId: taskRoute.listId,
+                    taskId: taskRoute.taskId,
+                  }),
+                },
+              });
+            }
+            return;
+          }
+
+          client.send({
+            type: 'message',
+            text,
+            replyToMessageId: inbound.replyToId,
+          });
+        } catch (error) {
+          if (inbound.workItemId) {
+            const message = error instanceof Error ? error.message : String(error);
+            try {
+              await transitionAgentWorkItem({
+                account,
+                workItemId: inbound.workItemId,
+                action: 'fail',
+                body: {
+                  sessionKey: resolvedSessionKey,
+                  error: message,
+                  metadataJson: JSON.stringify({
+                    transport: 'openclaw-plugin',
+                    state: 'reply-persistence-failed',
+                  }),
+                },
+              });
+            } catch (transitionError) {
+              console.error('[NC] failed marking work item as failed', transitionError);
+            }
+          }
+          throw error;
+        }
       },
       onError: (err, info) => {
         console.error(`[NC] ${info.kind} reply failed`, err);
       },
     },
   });
-}
-
-function resolveInboundContext(message: InboundMessage, account: NextCompanyAccountConfig): RoutedInboundContext | undefined {
-  switch (message.type) {
-    case 'message':
-      return buildMessageContext(message);
-    case 'notification':
-      return buildNotificationContext(message, normalizeBaseUrl(account.url));
-    case 'check_in':
-      return buildCheckInContext(message);
-    case 'mailbox_email':
-      return buildMailboxContext(message);
-    default:
-      return undefined;
-  }
 }
 
 const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
@@ -613,17 +1390,24 @@ const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
           return;
         }
 
-        const inbound = resolveInboundContext(message, account);
-        if (!inbound || !channelRuntime) return;
-
-        client.sendAvatarStatus('working');
         try {
+          const inbound = await resolveInboundContext(message, account);
+          if (!inbound || !channelRuntime) return;
+
+          client.sendAvatarStatus('working');
           await dispatchInboundContext({
             cfg,
             accountId,
+            account,
             inbound,
             channelRuntime,
             client,
+          });
+        } catch (err) {
+          console.error('[NC] inbound handling failed', {
+            accountId,
+            messageType: message.type,
+            err,
           });
         } finally {
           setTimeout(() => {
