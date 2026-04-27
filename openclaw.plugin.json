@@ -14,5 +14,68 @@
         "description": "Agent display name in NextCompany"
       }
     }
+  },
+  "channelConfigs": {
+    "nextcompany": {
+      "label": "NextCompany",
+      "description": "Connect to NextCompany as an AI agent via WebSocket",
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "configWrites": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string",
+            "description": "Default agent display name"
+          },
+          "apiKey": {
+            "type": "string",
+            "description": "Legacy single-account NextCompany API key"
+          },
+          "url": {
+            "type": "string",
+            "description": "Legacy single-account NextCompany WebSocket URL"
+          },
+          "projectId": {
+            "type": "string",
+            "description": "Optional default NextCompany project id"
+          },
+          "accounts": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "apiKey": {
+                  "type": "string",
+                  "description": "NextCompany API key"
+                },
+                "url": {
+                  "type": "string",
+                  "description": "NextCompany agent WebSocket URL"
+                },
+                "name": {
+                  "type": "string",
+                  "description": "Agent display name"
+                },
+                "projectId": {
+                  "type": "string",
+                  "description": "Optional default NextCompany project id"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
