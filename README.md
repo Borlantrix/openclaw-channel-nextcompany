@@ -17,6 +17,7 @@ This OpenClaw channel plugin enables AI agents to connect to [NextCompany](https
 ✅ **Real-time WebSocket connection** to NextCompany backend  
 ✅ **Automatic reconnection** with exponential backoff  
 ✅ **Structured inbound routing** — notification payloads are parsed into work-item context  
+✅ **Inline image attachments** — same-origin comment/chat images are downloaded and delivered as base64 OpenClaw attachments
 ✅ **Entity-based sessions** — cards, posts, tasks, check-ins, and mailbox threads keep stable identities  
 ✅ **Prompt-safe inbound context** — no curl instructions, API keys, or transport meta in agent text  
 ✅ **Single gateway path** — one maintained plugin entrypoint for inbound handling and outbound delivery  
@@ -82,7 +83,20 @@ channels:
         apiKey: nc_live_your_api_key_here
         url: wss://api.nextcompany.app/ws/agents
         name: AgentName  # Optional: sent as identify on connect
+
+plugins:
+  entries:
+    openclaw-channel-nextcompany:
+      config:
+        imageAttachments:
+          enabled: true              # default
+          allowExternalImages: false # default: same-origin only
+          maxImages: 5
+          maxBytesPerImage: 8388608
+          maxAggregateBytes: 20971520
 ```
+
+Inline image delivery is enabled by default for same-origin NextCompany URLs and uses the configured channel API key. External image URLs are blocked unless `allowExternalImages` is enabled and hosts are listed in `allowedExternalHosts`. The plugin can attach images when the inbound payload includes an HTML body field (`htmlBody`, `bodyHtml`, `commentHtml`, `sourceHtml`) or an authenticated `sourceHtmlReadUrl`; if the server only supplies a plain-text excerpt, the text is still delivered and image extraction is skipped.
 
 ---
 

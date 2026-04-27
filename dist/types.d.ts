@@ -26,6 +26,8 @@ export interface NextCompanyIdentifiedMessage {
 export interface NextCompanyDirectMessage {
     type: 'message';
     text: string;
+    htmlBody?: string;
+    bodyHtml?: string;
     messageId?: string;
     timestamp?: string;
     fromUserId?: string;
@@ -53,6 +55,10 @@ export interface NextCompanyNotificationMessage {
     ProjectId?: string;
     excerpt?: string;
     Excerpt?: string;
+    htmlBody?: string;
+    HtmlBody?: string;
+    bodyHtml?: string;
+    BodyHtml?: string;
     actorName?: string;
     ActorName?: string;
     actorAvatarUrl?: string;
@@ -172,6 +178,11 @@ export interface NextCompanyAgentWorkItemPayload {
     notificationKind?: string;
     sourceTitle?: string;
     excerpt?: string | null;
+    htmlBody?: string | null;
+    bodyHtml?: string | null;
+    commentHtml?: string | null;
+    sourceHtml?: string | null;
+    sourceHtmlReadUrl?: string | null;
     actorName?: string;
     actorAvatarUrl?: string | null;
     actionUrl?: string;
