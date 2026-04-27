@@ -4,6 +4,15 @@ import { homedir } from 'os';
 import { join } from 'path';
 import type { ChannelPlugin, OpenClawConfig, OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { createAccountListHelpers } from 'openclaw/plugin-sdk/account-helpers';
+import {
+  buildDirectImageSource,
+  extractHtmlImageSources,
+  resolveImageAttachmentConfig,
+  resolveImageAttachments,
+  type HtmlImageSource,
+  type OpenClawImageAttachment,
+  type SkippedImageAttachment,
+} from './media.js';
 import type {
   InboundMessage,
   NextCompanyAccountConfig,
@@ -71,6 +80,10 @@ interface RoutedInboundContext {
   workItemId?: string;
   sessionKey?: string;
   workItem?: NextCompanyAgentWorkItem;
+  htmlBodies?: Array<{ html: string; sourceKind: string }>;
+  directImageSources?: HtmlImageSource[];
+  attachments?: OpenClawImageAttachment[];
+  attachmentsSkipped?: SkippedImageAttachment[];
 }
 
 interface NextCompanyTransitionBody {
@@ -419,6 +432,66 @@ async function nextCompanyApiRequest<T>(params: {
   return await response.json() as T;
 }
 
+async function nextCompanyApiRawRequest(params: {
+  account: NextCompanyAccountConfig;
+  urlOrPath: string;
+  baseUrl: string;
+}): Promise<Response | undefined> {
+  let url: URL;
+  try {
+    url = new URL(params.urlOrPath, params.baseUrl);
+    const base = new URL(params.baseUrl);
+    if (url.origin !== base.origin) return undefined;
+  } catch {
+    return undefined;
+  }
+
+  return await fetch(url.toString(), {
+    method: 'GET',
+    headers: {
+      'X-Api-Key': params.account.apiKey,
+      Authorization: `Bearer ${params.account.apiKey}`,
+      Accept: 'application/json, text/html',
+    },
+  });
+}
+
+function extractHtmlFromUnknown(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() ? value : undefined;
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of ['htmlBody', 'bodyHtml', 'commentHtml', 'sourceHtml', 'body', 'Body']) {
+    const candidate = record[key];
+    if (typeof candidate === 'string' && candidate.trim()) return candidate;
+  }
+  return undefined;
+}
+
+async function fetchSourceHtml(params: {
+  account: NextCompanyAccountConfig;
+  baseUrl: string;
+  urlOrPath?: string | null;
+}): Promise<string | undefined> {
+  if (!params.urlOrPath?.trim()) return undefined;
+
+  try {
+    const response = await nextCompanyApiRawRequest({
+      account: params.account,
+      baseUrl: params.baseUrl,
+      urlOrPath: params.urlOrPath,
+    });
+    if (!response?.ok) return undefined;
+
+    const contentType = response.headers.get('content-type') ?? '';
+    if (contentType.toLowerCase().includes('application/json')) {
+      return extractHtmlFromUnknown(await response.json());
+    }
+    return await response.text();
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeToken(value: string | undefined, fallback = 'unknown'): string {
   const normalized = (value ?? '')
     .trim()
@@ -447,6 +520,37 @@ function joinContextLines(lines: Array<string | undefined>): string[] {
 
 function workItemPayloadField<T = string>(payload: NextCompanyAgentWorkItemPayload | undefined | null, key: keyof NextCompanyAgentWorkItemPayload): T | undefined {
   return payload?.[key] as T | undefined;
+}
+
+function workItemPayloadString(payload: NextCompanyAgentWorkItemPayload | undefined | null, key: keyof NextCompanyAgentWorkItemPayload): string | undefined {
+  const value = workItemPayloadField<string | null>(payload, key);
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function collectWorkItemHtmlBodies(workItem: NextCompanyAgentWorkItem): Array<{ html: string; sourceKind: string }> {
+  const payload = workItem.payload;
+  const html = [
+    workItemPayloadString(payload, 'htmlBody'),
+    workItemPayloadString(payload, 'bodyHtml'),
+    workItemPayloadString(payload, 'commentHtml'),
+    workItemPayloadString(payload, 'sourceHtml'),
+  ].find((value) => value?.trim());
+
+  if (!html) return [];
+
+  return [{
+    html,
+    sourceKind: `${normalizeToken(workItem.sourceType)}_${normalizeToken(workItem.triggerKind)}_inline`,
+  }];
+}
+
+function collectNotificationHtmlBodies(message: NextCompanyNotificationMessage): Array<{ html: string; sourceKind: string }> {
+  const html = notificationField<string>(message, 'htmlBody', 'HtmlBody')
+    ?? notificationField<string>(message, 'bodyHtml', 'BodyHtml');
+  if (!html?.trim()) return [];
+  const sourceType = notificationField(message, 'sourceType', 'SourceType');
+  const kind = notificationField(message, 'kind', 'Kind');
+  return [{ html, sourceKind: `${normalizeToken(sourceType)}_${normalizeToken(kind)}_inline` }];
 }
 
 function notificationField<T = string>(message: NextCompanyNotificationMessage, camel: keyof NextCompanyNotificationMessage, pascal?: keyof NextCompanyNotificationMessage): T | undefined {
@@ -658,6 +762,7 @@ function buildWorkItemContext(workItem: NextCompanyAgentWorkItem, account: NextC
     workItemId: workItem.id,
     sessionKey: workItem.sessionKey ?? undefined,
     workItem,
+    htmlBodies: collectWorkItemHtmlBodies(workItem),
   };
 }
 
@@ -709,15 +814,23 @@ function buildNotificationContext(message: NextCompanyNotificationMessage, baseU
       metadata.commentId ? `Comment id: ${metadata.commentId}` : undefined,
       actionUrl ? `Open in NextCompany: ${actionUrl}` : undefined,
     ]),
+    htmlBodies: collectNotificationHtmlBodies(message),
   };
 }
 
-function buildMessageContext(message: NextCompanyDirectMessage): RoutedInboundContext {
+function buildMessageContext(message: NextCompanyDirectMessage, baseUrl: string): RoutedInboundContext {
   const senderId = normalizeToken(message.fromUserId ?? message.from ?? message.channelId, 'system');
   const senderName = normalizeLabel(message.fromName ?? message.senderName ?? message.from, 'NextCompany');
   const attachmentLine = message.attachmentUrl
     ? `Attachment: ${message.attachmentFileName ?? message.attachmentUrl}`
     : undefined;
+  const directImage = buildDirectImageSource({
+    url: message.attachmentUrl,
+    baseUrl,
+    sourceKind: 'chat_attachment',
+    alt: message.attachmentFileName,
+  });
+  const html = message.htmlBody?.trim() || message.bodyHtml?.trim();
 
   return {
     rawBody: joinContextLines([message.text, attachmentLine]).join('\n\n'),
@@ -737,6 +850,8 @@ function buildMessageContext(message: NextCompanyDirectMessage): RoutedInboundCo
       message.attachmentUrl ? `Attachment URL: ${message.attachmentUrl}` : undefined,
       message.attachmentContentType ? `Attachment content type: ${message.attachmentContentType}` : undefined,
     ]),
+    htmlBodies: html ? [{ html, sourceKind: 'chat_message_inline' }] : undefined,
+    directImageSources: directImage ? [directImage] : undefined,
   };
 }
 
@@ -1070,6 +1185,7 @@ async function executeGithubPrWorkItem(params: {
 }
 
 async function resolveInboundContext(message: InboundMessage, account: NextCompanyAccountConfig): Promise<RoutedInboundContext | undefined> {
+  const baseUrl = normalizeBaseUrl(account.url);
   const referencedWorkItemId = (
     message.type === 'agent_wake' || message.type === 'notification'
   ) ? resolveReferencedWorkItemId(message) : undefined;
@@ -1092,14 +1208,28 @@ async function resolveInboundContext(message: InboundMessage, account: NextCompa
     }
 
     const workItem = await fetchAgentWorkItem(account, referencedWorkItemId);
-    return buildWorkItemContext(workItem, account);
+    const inbound = buildWorkItemContext(workItem, account);
+    if (!inbound.htmlBodies?.length) {
+      const fetchedHtml = await fetchSourceHtml({
+        account,
+        baseUrl,
+        urlOrPath: workItemPayloadString(workItem.payload, 'sourceHtmlReadUrl'),
+      });
+      if (fetchedHtml) {
+        inbound.htmlBodies = [{
+          html: fetchedHtml,
+          sourceKind: `${normalizeToken(workItem.sourceType)}_${normalizeToken(workItem.triggerKind)}_inline`,
+        }];
+      }
+    }
+    return inbound;
   }
 
   switch (message.type) {
     case 'message':
-      return buildMessageContext(message);
+      return buildMessageContext(message, baseUrl);
     case 'notification':
-      return buildNotificationContext(message, normalizeBaseUrl(account.url));
+      return buildNotificationContext(message, baseUrl);
     case 'check_in':
       return buildCheckInContext(message);
     case 'mailbox_email':
@@ -1135,6 +1265,48 @@ async function dispatchInboundContext(params: {
     storePath,
     sessionKey: route.sessionKey,
   });
+
+  const imageConfig = resolveImageAttachmentConfig(getPluginConfig(cfg));
+  if (imageConfig.enabled && (!inbound.attachments || !inbound.attachmentsSkipped)) {
+    const baseUrl = normalizeBaseUrl(account.url);
+    const htmlSources = (inbound.htmlBodies ?? []).flatMap((entry) => (
+      extractHtmlImageSources(entry.html, baseUrl, entry.sourceKind)
+    ));
+    const directSources = inbound.directImageSources ?? [];
+
+    try {
+      const resolved = await resolveImageAttachments({
+        account,
+        baseUrl,
+        sources: [...htmlSources, ...directSources],
+        config: imageConfig,
+      });
+      inbound.attachments = resolved.attachments;
+      inbound.attachmentsSkipped = resolved.skipped;
+      if (resolved.attachments.length > 0 || resolved.skipped.length > 0) {
+        console.log('[NC] image attachments processed', {
+          accountId,
+          messageSid: inbound.messageSid,
+          found: htmlSources.length + directSources.length,
+          attached: resolved.attachments.length,
+          skipped: resolved.skipped.length,
+        });
+      }
+    } catch (error) {
+      console.error('[NC] image attachment processing failed', {
+        accountId,
+        messageSid: inbound.messageSid,
+        err: error,
+      });
+      inbound.attachments = [];
+      inbound.attachmentsSkipped = [];
+    }
+  }
+
+  const attachmentSummary = inbound.attachments?.length
+    ? inbound.attachments.map((attachment) => `[image attached: ${attachment.fileName ?? attachment.mimeType} (${attachment.mimeType})]`).join('\n')
+    : undefined;
+  const agentBody = joinContextLines([attachmentSummary, inbound.rawBody]).join('\n\n');
   const envelope = channelRuntime.reply.resolveEnvelopeFormatOptions(cfg);
   const body = channelRuntime.reply.formatAgentEnvelope({
     channel: CHANNEL_LABEL,
@@ -1142,7 +1314,7 @@ async function dispatchInboundContext(params: {
     timestamp: inbound.timestamp,
     previousTimestamp,
     envelope,
-    body: inbound.rawBody,
+    body: agentBody,
   });
 
   const resolvedSessionKey = route.sessionKey ?? inbound.sessionKey ?? inbound.peerId;
@@ -1239,7 +1411,7 @@ async function dispatchInboundContext(params: {
 
   const ctxPayload = channelRuntime.reply.finalizeInboundContext({
     Body: body,
-    BodyForAgent: inbound.rawBody,
+    BodyForAgent: agentBody,
     RawBody: inbound.rawBody,
     CommandBody: inbound.rawBody,
     From: inbound.from,
@@ -1261,7 +1433,13 @@ async function dispatchInboundContext(params: {
     OriginatingChannel: CHANNEL_ID,
     OriginatingTo: inbound.to,
     ExplicitDeliverRoute: true,
-    UntrustedContext: inbound.untrustedContext,
+    UntrustedContext: joinContextLines([
+      ...(inbound.untrustedContext ?? []),
+      inbound.attachments?.length ? `Image attachments: ${inbound.attachments.length}` : undefined,
+      inbound.attachmentsSkipped?.length ? `Image attachments skipped: ${inbound.attachmentsSkipped.length}` : undefined,
+    ]),
+    ...(inbound.attachments?.length ? { Attachments: inbound.attachments } : {}),
+    ...(inbound.attachmentsSkipped?.length ? { AttachmentsSkipped: inbound.attachmentsSkipped } : {}),
   });
 
   await channelRuntime.session.recordInboundSession({

@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { createAccountListHelpers } from 'openclaw/plugin-sdk/account-helpers';
+import { buildDirectImageSource, extractHtmlImageSources, resolveImageAttachmentConfig, resolveImageAttachments, } from './media.js';
 import { NextCompanyWebSocketClient } from './websocket.js';
 const CHANNEL_ID = 'nextcompany';
 const CHANNEL_LABEL = 'NextCompany';
@@ -297,6 +298,60 @@ async function nextCompanyApiRequest(params) {
         return undefined;
     return await response.json();
 }
+async function nextCompanyApiRawRequest(params) {
+    let url;
+    try {
+        url = new URL(params.urlOrPath, params.baseUrl);
+        const base = new URL(params.baseUrl);
+        if (url.origin !== base.origin)
+            return undefined;
+    }
+    catch {
+        return undefined;
+    }
+    return await fetch(url.toString(), {
+        method: 'GET',
+        headers: {
+            'X-Api-Key': params.account.apiKey,
+            Authorization: `Bearer ${params.account.apiKey}`,
+            Accept: 'application/json, text/html',
+        },
+    });
+}
+function extractHtmlFromUnknown(value) {
+    if (typeof value === 'string')
+        return value.trim() ? value : undefined;
+    if (!value || typeof value !== 'object')
+        return undefined;
+    const record = value;
+    for (const key of ['htmlBody', 'bodyHtml', 'commentHtml', 'sourceHtml', 'body', 'Body']) {
+        const candidate = record[key];
+        if (typeof candidate === 'string' && candidate.trim())
+            return candidate;
+    }
+    return undefined;
+}
+async function fetchSourceHtml(params) {
+    if (!params.urlOrPath?.trim())
+        return undefined;
+    try {
+        const response = await nextCompanyApiRawRequest({
+            account: params.account,
+            baseUrl: params.baseUrl,
+            urlOrPath: params.urlOrPath,
+        });
+        if (!response?.ok)
+            return undefined;
+        const contentType = response.headers.get('content-type') ?? '';
+        if (contentType.toLowerCase().includes('application/json')) {
+            return extractHtmlFromUnknown(await response.json());
+        }
+        return await response.text();
+    }
+    catch {
+        return undefined;
+    }
+}
 function normalizeToken(value, fallback = 'unknown') {
     const normalized = (value ?? '')
         .trim()
@@ -322,6 +377,34 @@ function joinContextLines(lines) {
 }
 function workItemPayloadField(payload, key) {
     return payload?.[key];
+}
+function workItemPayloadString(payload, key) {
+    const value = workItemPayloadField(payload, key);
+    return typeof value === 'string' && value.trim() ? value : undefined;
+}
+function collectWorkItemHtmlBodies(workItem) {
+    const payload = workItem.payload;
+    const html = [
+        workItemPayloadString(payload, 'htmlBody'),
+        workItemPayloadString(payload, 'bodyHtml'),
+        workItemPayloadString(payload, 'commentHtml'),
+        workItemPayloadString(payload, 'sourceHtml'),
+    ].find((value) => value?.trim());
+    if (!html)
+        return [];
+    return [{
+            html,
+            sourceKind: `${normalizeToken(workItem.sourceType)}_${normalizeToken(workItem.triggerKind)}_inline`,
+        }];
+}
+function collectNotificationHtmlBodies(message) {
+    const html = notificationField(message, 'htmlBody', 'HtmlBody')
+        ?? notificationField(message, 'bodyHtml', 'BodyHtml');
+    if (!html?.trim())
+        return [];
+    const sourceType = notificationField(message, 'sourceType', 'SourceType');
+    const kind = notificationField(message, 'kind', 'Kind');
+    return [{ html, sourceKind: `${normalizeToken(sourceType)}_${normalizeToken(kind)}_inline` }];
 }
 function notificationField(message, camel, pascal) {
     return message[camel]
@@ -512,6 +595,7 @@ function buildWorkItemContext(workItem, account) {
         workItemId: workItem.id,
         sessionKey: workItem.sessionKey ?? undefined,
         workItem,
+        htmlBodies: collectWorkItemHtmlBodies(workItem),
     };
 }
 function buildNotificationContext(message, baseUrl) {
@@ -561,14 +645,22 @@ function buildNotificationContext(message, baseUrl) {
             metadata.commentId ? `Comment id: ${metadata.commentId}` : undefined,
             actionUrl ? `Open in NextCompany: ${actionUrl}` : undefined,
         ]),
+        htmlBodies: collectNotificationHtmlBodies(message),
     };
 }
-function buildMessageContext(message) {
+function buildMessageContext(message, baseUrl) {
     const senderId = normalizeToken(message.fromUserId ?? message.from ?? message.channelId, 'system');
     const senderName = normalizeLabel(message.fromName ?? message.senderName ?? message.from, 'NextCompany');
     const attachmentLine = message.attachmentUrl
         ? `Attachment: ${message.attachmentFileName ?? message.attachmentUrl}`
         : undefined;
+    const directImage = buildDirectImageSource({
+        url: message.attachmentUrl,
+        baseUrl,
+        sourceKind: 'chat_attachment',
+        alt: message.attachmentFileName,
+    });
+    const html = message.htmlBody?.trim() || message.bodyHtml?.trim();
     return {
         rawBody: joinContextLines([message.text, attachmentLine]).join('\n\n'),
         from: `nextcompany:user:${senderId}`,
@@ -587,6 +679,8 @@ function buildMessageContext(message) {
             message.attachmentUrl ? `Attachment URL: ${message.attachmentUrl}` : undefined,
             message.attachmentContentType ? `Attachment content type: ${message.attachmentContentType}` : undefined,
         ]),
+        htmlBodies: html ? [{ html, sourceKind: 'chat_message_inline' }] : undefined,
+        directImageSources: directImage ? [directImage] : undefined,
     };
 }
 function buildCheckInContext(message) {
@@ -858,6 +952,7 @@ async function executeGithubPrWorkItem(params) {
     };
 }
 async function resolveInboundContext(message, account) {
+    const baseUrl = normalizeBaseUrl(account.url);
     const referencedWorkItemId = (message.type === 'agent_wake' || message.type === 'notification') ? resolveReferencedWorkItemId(message) : undefined;
     if (referencedWorkItemId) {
         if (message.type === 'agent_wake') {
@@ -876,13 +971,27 @@ async function resolveInboundContext(message, account) {
             });
         }
         const workItem = await fetchAgentWorkItem(account, referencedWorkItemId);
-        return buildWorkItemContext(workItem, account);
+        const inbound = buildWorkItemContext(workItem, account);
+        if (!inbound.htmlBodies?.length) {
+            const fetchedHtml = await fetchSourceHtml({
+                account,
+                baseUrl,
+                urlOrPath: workItemPayloadString(workItem.payload, 'sourceHtmlReadUrl'),
+            });
+            if (fetchedHtml) {
+                inbound.htmlBodies = [{
+                        html: fetchedHtml,
+                        sourceKind: `${normalizeToken(workItem.sourceType)}_${normalizeToken(workItem.triggerKind)}_inline`,
+                    }];
+            }
+        }
+        return inbound;
     }
     switch (message.type) {
         case 'message':
-            return buildMessageContext(message);
+            return buildMessageContext(message, baseUrl);
         case 'notification':
-            return buildNotificationContext(message, normalizeBaseUrl(account.url));
+            return buildNotificationContext(message, baseUrl);
         case 'check_in':
             return buildCheckInContext(message);
         case 'mailbox_email':
@@ -909,6 +1018,44 @@ async function dispatchInboundContext(params) {
         storePath,
         sessionKey: route.sessionKey,
     });
+    const imageConfig = resolveImageAttachmentConfig(getPluginConfig(cfg));
+    if (imageConfig.enabled && (!inbound.attachments || !inbound.attachmentsSkipped)) {
+        const baseUrl = normalizeBaseUrl(account.url);
+        const htmlSources = (inbound.htmlBodies ?? []).flatMap((entry) => (extractHtmlImageSources(entry.html, baseUrl, entry.sourceKind)));
+        const directSources = inbound.directImageSources ?? [];
+        try {
+            const resolved = await resolveImageAttachments({
+                account,
+                baseUrl,
+                sources: [...htmlSources, ...directSources],
+                config: imageConfig,
+            });
+            inbound.attachments = resolved.attachments;
+            inbound.attachmentsSkipped = resolved.skipped;
+            if (resolved.attachments.length > 0 || resolved.skipped.length > 0) {
+                console.log('[NC] image attachments processed', {
+                    accountId,
+                    messageSid: inbound.messageSid,
+                    found: htmlSources.length + directSources.length,
+                    attached: resolved.attachments.length,
+                    skipped: resolved.skipped.length,
+                });
+            }
+        }
+        catch (error) {
+            console.error('[NC] image attachment processing failed', {
+                accountId,
+                messageSid: inbound.messageSid,
+                err: error,
+            });
+            inbound.attachments = [];
+            inbound.attachmentsSkipped = [];
+        }
+    }
+    const attachmentSummary = inbound.attachments?.length
+        ? inbound.attachments.map((attachment) => `[image attached: ${attachment.fileName ?? attachment.mimeType} (${attachment.mimeType})]`).join('\n')
+        : undefined;
+    const agentBody = joinContextLines([attachmentSummary, inbound.rawBody]).join('\n\n');
     const envelope = channelRuntime.reply.resolveEnvelopeFormatOptions(cfg);
     const body = channelRuntime.reply.formatAgentEnvelope({
         channel: CHANNEL_LABEL,
@@ -916,7 +1063,7 @@ async function dispatchInboundContext(params) {
         timestamp: inbound.timestamp,
         previousTimestamp,
         envelope,
-        body: inbound.rawBody,
+        body: agentBody,
     });
     const resolvedSessionKey = route.sessionKey ?? inbound.sessionKey ?? inbound.peerId;
     if (inbound.workItemId) {
@@ -1007,7 +1154,7 @@ async function dispatchInboundContext(params) {
     }
     const ctxPayload = channelRuntime.reply.finalizeInboundContext({
         Body: body,
-        BodyForAgent: inbound.rawBody,
+        BodyForAgent: agentBody,
         RawBody: inbound.rawBody,
         CommandBody: inbound.rawBody,
         From: inbound.from,
@@ -1029,7 +1176,13 @@ async function dispatchInboundContext(params) {
         OriginatingChannel: CHANNEL_ID,
         OriginatingTo: inbound.to,
         ExplicitDeliverRoute: true,
-        UntrustedContext: inbound.untrustedContext,
+        UntrustedContext: joinContextLines([
+            ...(inbound.untrustedContext ?? []),
+            inbound.attachments?.length ? `Image attachments: ${inbound.attachments.length}` : undefined,
+            inbound.attachmentsSkipped?.length ? `Image attachments skipped: ${inbound.attachmentsSkipped.length}` : undefined,
+        ]),
+        ...(inbound.attachments?.length ? { Attachments: inbound.attachments } : {}),
+        ...(inbound.attachmentsSkipped?.length ? { AttachmentsSkipped: inbound.attachmentsSkipped } : {}),
     });
     await channelRuntime.session.recordInboundSession({
         storePath,

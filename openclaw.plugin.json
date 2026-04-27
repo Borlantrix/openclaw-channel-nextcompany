@@ -12,6 +12,42 @@
       "name": {
         "type": "string",
         "description": "Agent display name in NextCompany"
+      },
+      "imageAttachments": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Inline image download and base64 attachment delivery for agent comments/messages",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Download same-origin inline images and deliver them as OpenClaw attachments"
+          },
+          "allowExternalImages": {
+            "type": "boolean",
+            "default": false,
+            "description": "Allow external image URLs. External hosts must also be listed in allowedExternalHosts."
+          },
+          "allowedExternalHosts": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "allowedMimeTypes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["image/png", "image/jpeg", "image/webp", "image/gif"]
+            },
+            "default": ["image/png", "image/jpeg", "image/webp", "image/gif"]
+          },
+          "maxImages": { "type": "integer", "minimum": 1, "default": 5 },
+          "maxBytesPerImage": { "type": "integer", "minimum": 1, "default": 8388608 },
+          "maxAggregateBytes": { "type": "integer", "minimum": 1, "default": 20971520 },
+          "timeoutMs": { "type": "integer", "minimum": 1, "default": 10000 },
+          "aggregateTimeoutMs": { "type": "integer", "minimum": 1, "default": 20000 },
+          "maxRedirects": { "type": "integer", "minimum": 0, "default": 2 }
+        }
       }
     }
   },
