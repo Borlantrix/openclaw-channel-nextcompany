@@ -1045,6 +1045,51 @@ async function createTaskComment(params: {
   });
 }
 
+function resolveCardCommentPathFromWorkItem(workItem: NextCompanyAgentWorkItem): string | undefined {
+  const payload = workItem.payload;
+  const commentPostUrl = workItemPayloadString(payload, 'commentPostUrl');
+  if (commentPostUrl) return commentPostUrl;
+
+  const tableId = workItemPayloadString(payload, 'tableId');
+  const cardId = workItem.sourceId;
+  if (!workItem.projectId || !tableId || !cardId) return undefined;
+
+  return `/api/projects/${workItem.projectId}/card-tables/${tableId}/cards/${cardId}/comments`;
+}
+
+async function createCardComment(params: {
+  account: NextCompanyAccountConfig;
+  workItem: NextCompanyAgentWorkItem;
+  text: string;
+}): Promise<void> {
+  const path = resolveCardCommentPathFromWorkItem(params.workItem);
+  if (!path) {
+    throw new Error(`Unable to resolve card comment route for work item ${params.workItem.id}.`);
+  }
+
+  const body = plainTextToHtml(params.text);
+  if (!body.trim()) return;
+
+  await nextCompanyApiRequest({
+    account: params.account,
+    path,
+    method: 'POST',
+    body: JSON.stringify({ body }),
+  });
+}
+
+async function persistCardReply(params: {
+  account: NextCompanyAccountConfig;
+  workItem: NextCompanyAgentWorkItem;
+  text: string;
+}): Promise<void> {
+  await createCardComment({
+    account: params.account,
+    workItem: params.workItem,
+    text: params.text,
+  });
+}
+
 async function completeTaskIfNeeded(params: {
   account: NextCompanyAccountConfig;
   projectId: string;
@@ -1490,6 +1535,32 @@ async function dispatchInboundContext(params: {
         if (!text.trim()) return;
 
         try {
+          if (inbound.workItem && normalizeToken(inbound.workItem.sourceType) === 'card') {
+            await persistCardReply({
+              account,
+              workItem: inbound.workItem,
+              text,
+            });
+
+            if (inbound.workItemId) {
+              await transitionAgentWorkItem({
+                account,
+                workItemId: inbound.workItemId,
+                action: 'complete',
+                body: {
+                  sessionKey: resolvedSessionKey,
+                  metadataJson: JSON.stringify({
+                    transport: 'openclaw-plugin',
+                    state: 'card-commented-and-completed',
+                    projectId: inbound.workItem.projectId,
+                    cardId: inbound.workItem.sourceId,
+                  }),
+                },
+              });
+            }
+            return;
+          }
+
           if (inbound.workItem && normalizeToken(inbound.workItem.sourceType) === 'task') {
             const taskRoute = await persistTaskReplyAndComplete({
               account,
