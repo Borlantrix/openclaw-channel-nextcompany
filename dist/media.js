@@ -9,6 +9,8 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_AGGREGATE_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_REDIRECTS = 2;
 const DEFAULT_ALLOWED_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+const DEFAULT_TRUSTED_MEDIA_HOSTS = ['nextcompany.blob.core.windows.net'];
+const DEFAULT_TRUSTED_MEDIA_PATH_PREFIXES = ['/task-images/'];
 export function resolveImageAttachmentConfig(raw) {
     const imageConfig = raw?.['imageAttachments'];
     const allowedMimeTypes = Array.isArray(imageConfig?.['allowedMimeTypes'])
@@ -34,9 +36,16 @@ export function extractHtmlImageSources(html, baseUrl, sourceKind) {
         return [];
     const images = [];
     let order = 0;
+    let mentionDepth = 0;
     const parser = new Parser({
         onopentag(name, attributes) {
-            if (name.toLowerCase() !== 'img')
+            const tagName = name.toLowerCase();
+            if (tagName === 'span' && isMentionElement(attributes)) {
+                mentionDepth++;
+            }
+            if (tagName !== 'img')
+                return;
+            if (mentionDepth > 0 || isMentionImage(attributes))
                 return;
             const rawSrc = attributes['src']?.trim();
             if (!rawSrc || rawSrc.toLowerCase().startsWith('data:'))
@@ -60,6 +69,10 @@ export function extractHtmlImageSources(html, baseUrl, sourceKind) {
             catch {
                 // Ignore malformed image references and keep processing the rest of the HTML.
             }
+        },
+        onclosetag(name) {
+            if (name.toLowerCase() === 'span' && mentionDepth > 0)
+                mentionDepth--;
         },
     }, { decodeEntities: true });
     parser.write(html);
@@ -244,6 +257,8 @@ async function validateUrlPolicy(url, baseUrl, config) {
         return 'unsupported_scheme';
     if (sameOrigin(parsed, base))
         return undefined;
+    if (isDefaultTrustedMediaUrl(parsed))
+        return undefined;
     if (!config.allowExternalImages)
         return 'external_url_blocked';
     if (!config.allowedExternalHosts.includes(parsed.hostname.toLowerCase()))
@@ -341,6 +356,23 @@ function sameOrigin(a, b) {
 function isLocalhost(hostname) {
     const normalized = hostname.toLowerCase();
     return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
+}
+function isMentionElement(attributes) {
+    return attributes['data-type']?.toLowerCase() === 'mention'
+        || classListIncludes(attributes['class'], 'mention');
+}
+function isMentionImage(attributes) {
+    return classListIncludes(attributes['class'], 'mention-avatar')
+        || classListIncludes(attributes['class'], 'avatar')
+        || attributes['data-avatar'] !== undefined;
+}
+function classListIncludes(value, className) {
+    return value?.split(/\s+/).some((item) => item.toLowerCase() === className) ?? false;
+}
+function isDefaultTrustedMediaUrl(url) {
+    const hostname = url.hostname.toLowerCase();
+    return DEFAULT_TRUSTED_MEDIA_HOSTS.includes(hostname)
+        && DEFAULT_TRUSTED_MEDIA_PATH_PREFIXES.some((prefix) => url.pathname.startsWith(prefix));
 }
 async function resolvesToPrivateAddress(hostname) {
     if (isPrivateAddress(hostname))
