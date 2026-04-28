@@ -125,6 +125,10 @@ Telegram / Active Channel
 
 ## Development
 
+### Versioning
+
+Every functional plugin change must bump `package.json` version before merge so deployed agents can be audited quickly. Use patch bumps for fixes, minor bumps for backward-compatible features, and major bumps for breaking changes.
+
 ### Build
 
 ```bash
