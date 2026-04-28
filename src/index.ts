@@ -456,11 +456,36 @@ async function nextCompanyApiRawRequest(params: {
   });
 }
 
-function extractHtmlFromUnknown(value: unknown): string | undefined {
+function extractHtmlFromUnknown(value: unknown, preferredId?: string | null): string | undefined {
   if (typeof value === 'string') return value.trim() ? value : undefined;
   if (!value || typeof value !== 'object') return undefined;
+
+  if (Array.isArray(value)) {
+    const preferred = preferredId
+      ? value.find((item) => objectStringField(item, 'id', 'Id') === preferredId)
+      : undefined;
+    const preferredHtml = preferred ? extractHtmlFromUnknown(preferred, preferredId) : undefined;
+    if (preferredHtml) return preferredHtml;
+
+    for (const item of value) {
+      const html = extractHtmlFromUnknown(item, preferredId);
+      if (html) return html;
+    }
+    return undefined;
+  }
+
   const record = value as Record<string, unknown>;
   for (const key of ['htmlBody', 'bodyHtml', 'commentHtml', 'sourceHtml', 'body', 'Body']) {
+    const candidate = record[key];
+    if (typeof candidate === 'string' && candidate.trim()) return candidate;
+  }
+  return undefined;
+}
+
+function objectStringField(value: unknown, ...keys: string[]): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
     const candidate = record[key];
     if (typeof candidate === 'string' && candidate.trim()) return candidate;
   }
@@ -471,6 +496,7 @@ async function fetchSourceHtml(params: {
   account: NextCompanyAccountConfig;
   baseUrl: string;
   urlOrPath?: string | null;
+  preferredId?: string | null;
 }): Promise<string | undefined> {
   if (!params.urlOrPath?.trim()) return undefined;
 
@@ -484,7 +510,7 @@ async function fetchSourceHtml(params: {
 
     const contentType = response.headers.get('content-type') ?? '';
     if (contentType.toLowerCase().includes('application/json')) {
-      return extractHtmlFromUnknown(await response.json());
+      return extractHtmlFromUnknown(await response.json(), params.preferredId);
     }
     return await response.text();
   } catch {
@@ -1213,7 +1239,9 @@ async function resolveInboundContext(message: InboundMessage, account: NextCompa
       const fetchedHtml = await fetchSourceHtml({
         account,
         baseUrl,
-        urlOrPath: workItemPayloadString(workItem.payload, 'sourceHtmlReadUrl'),
+        urlOrPath: workItemPayloadString(workItem.payload, 'sourceHtmlReadUrl')
+          ?? workItemPayloadString(workItem.payload, 'commentReadUrl'),
+        preferredId: workItem.commentId,
       });
       if (fetchedHtml) {
         inbound.htmlBodies = [{

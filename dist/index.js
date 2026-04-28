@@ -318,13 +318,38 @@ async function nextCompanyApiRawRequest(params) {
         },
     });
 }
-function extractHtmlFromUnknown(value) {
+function extractHtmlFromUnknown(value, preferredId) {
     if (typeof value === 'string')
         return value.trim() ? value : undefined;
     if (!value || typeof value !== 'object')
         return undefined;
+    if (Array.isArray(value)) {
+        const preferred = preferredId
+            ? value.find((item) => objectStringField(item, 'id', 'Id') === preferredId)
+            : undefined;
+        const preferredHtml = preferred ? extractHtmlFromUnknown(preferred, preferredId) : undefined;
+        if (preferredHtml)
+            return preferredHtml;
+        for (const item of value) {
+            const html = extractHtmlFromUnknown(item, preferredId);
+            if (html)
+                return html;
+        }
+        return undefined;
+    }
     const record = value;
     for (const key of ['htmlBody', 'bodyHtml', 'commentHtml', 'sourceHtml', 'body', 'Body']) {
+        const candidate = record[key];
+        if (typeof candidate === 'string' && candidate.trim())
+            return candidate;
+    }
+    return undefined;
+}
+function objectStringField(value, ...keys) {
+    if (!value || typeof value !== 'object')
+        return undefined;
+    const record = value;
+    for (const key of keys) {
         const candidate = record[key];
         if (typeof candidate === 'string' && candidate.trim())
             return candidate;
@@ -344,7 +369,7 @@ async function fetchSourceHtml(params) {
             return undefined;
         const contentType = response.headers.get('content-type') ?? '';
         if (contentType.toLowerCase().includes('application/json')) {
-            return extractHtmlFromUnknown(await response.json());
+            return extractHtmlFromUnknown(await response.json(), params.preferredId);
         }
         return await response.text();
     }
@@ -976,7 +1001,9 @@ async function resolveInboundContext(message, account) {
             const fetchedHtml = await fetchSourceHtml({
                 account,
                 baseUrl,
-                urlOrPath: workItemPayloadString(workItem.payload, 'sourceHtmlReadUrl'),
+                urlOrPath: workItemPayloadString(workItem.payload, 'sourceHtmlReadUrl')
+                    ?? workItemPayloadString(workItem.payload, 'commentReadUrl'),
+                preferredId: workItem.commentId,
             });
             if (fetchedHtml) {
                 inbound.htmlBodies = [{

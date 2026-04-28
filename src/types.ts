@@ -197,6 +197,8 @@ export interface NextCompanyAgentWorkItemPayload {
   commentHtml?: string | null;
   sourceHtml?: string | null;
   sourceHtmlReadUrl?: string | null;
+  commentReadUrl?: string | null;
+  commentPostUrl?: string | null;
   actorName?: string;
   actorAvatarUrl?: string | null;
   actionUrl?: string;
