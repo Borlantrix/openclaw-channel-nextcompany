@@ -228,6 +228,7 @@ export type OutboundMessage = {
     type: 'message';
     text: string;
     replyToMessageId?: string;
+    channelId?: string;
 } | {
     type: 'ping';
 } | {
