@@ -252,7 +252,7 @@ export type InboundMessage =
   | NextCompanyPongMessage;
 
 export type OutboundMessage =
-  | { type: 'message'; text: string; replyToMessageId?: string }
+  | { type: 'message'; text: string; replyToMessageId?: string; channelId?: string }
   | { type: 'ping' }
   | { type: 'identify'; name: string }
   | { type: 'fileContent'; requestId: string; content: string | null; error: string | null }
