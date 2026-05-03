@@ -12,6 +12,7 @@ import {
   type OpenClawImageAttachment,
   type SkippedImageAttachment,
 } from './media.js';
+import { parseOutboundMediaMessage, uploadChatAttachment } from './outbound.js';
 import type {
   InboundMessage,
   NextCompanyAccountConfig,
@@ -28,7 +29,7 @@ import { NextCompanyWebSocketClient } from './websocket.js';
 
 const CHANNEL_ID = 'nextcompany';
 const CHANNEL_LABEL = 'NextCompany';
-const connections = new Map<string, { client: NextCompanyWebSocketClient; startedAt: number }>();
+const connections = new Map<string, { client: NextCompanyWebSocketClient; startedAt: number; organizationId?: string }>();
 
 const { listAccountIds, resolveDefaultAccountId } = createAccountListHelpers(CHANNEL_ID);
 type StartAccountContext = Parameters<
@@ -83,6 +84,8 @@ interface RoutedInboundContext {
   directImageSources?: HtmlImageSource[];
   attachments?: OpenClawImageAttachment[];
   attachmentsSkipped?: SkippedImageAttachment[];
+  channelId?: string;
+  organizationId?: string;
 }
 
 interface NextCompanyTransitionBody {
@@ -726,6 +729,7 @@ function buildMessageContext(message: NextCompanyDirectMessage, baseUrl: string)
     timestamp: toTimestamp(message.timestamp),
     messageSid: message.messageId,
     replyToId: message.messageId,
+    channelId: message.channelId,
     senderName,
     senderId,
     senderUsername: message.from,
@@ -1057,6 +1061,7 @@ async function dispatchInboundContext(params: {
   client: NextCompanyWebSocketClient;
 }): Promise<void> {
   const { cfg, accountId, account, inbound, channelRuntime, client } = params;
+  inbound.organizationId ??= connections.get(accountId)?.organizationId;
   const route = channelRuntime.routing.resolveAgentRoute({
     cfg,
     channel: CHANNEL_ID,
@@ -1194,6 +1199,7 @@ async function dispatchInboundContext(params: {
     MessageSidFull: inbound.messageSid,
     ReplyToId: inbound.replyToId,
     ReplyToIdFull: inbound.replyToId,
+    ChannelId: inbound.channelId,
     Provider: CHANNEL_ID,
     Surface: CHANNEL_ID,
     OriginatingChannel: CHANNEL_ID,
@@ -1221,13 +1227,34 @@ async function dispatchInboundContext(params: {
     ctx: ctxPayload,
     cfg,
     dispatcherOptions: {
-      deliver: async (payload: string | { text?: string; replyToId?: string }) => {
+      deliver: async (payload: string | { text?: string; replyToId?: string; channelId?: string }) => {
         const text = typeof payload === 'string'
           ? payload
-          : (payload as { text?: string; replyToId?: string }).text ?? '';
+          : payload.text ?? '';
         if (!text.trim()) return;
 
         try {
+          const parsedMedia = parseOutboundMediaMessage(text);
+          if (parsedMedia.files.length > 0) {
+            const channelId = typeof payload === 'string'
+              ? inbound.channelId
+              : payload.channelId ?? inbound.channelId;
+            const organizationId = inbound.organizationId;
+            if (!channelId) throw new Error('Cannot send outbound media without a NextCompany chat channelId.');
+            if (!organizationId) throw new Error('Cannot send outbound media without a NextCompany organizationId.');
+
+            for (const [index, file] of parsedMedia.files.entries()) {
+              await uploadChatAttachment({
+                account,
+                organizationId,
+                channelId,
+                file,
+                text: index === 0 ? parsedMedia.text : undefined,
+              });
+            }
+            return;
+          }
+
           if (inbound.workItem && normalizeToken(inbound.workItem.sourceType) === 'card') {
             await persistCardReply({
               account,
@@ -1285,6 +1312,7 @@ async function dispatchInboundContext(params: {
             type: 'message',
             text,
             replyToMessageId: inbound.replyToId,
+            channelId: inbound.channelId,
           });
         } catch (error) {
           if (inbound.workItemId) {
@@ -1357,6 +1385,11 @@ const channelPlugin: ChannelPlugin<NextCompanyAccountConfig> = {
         const entry = connections.get(accountId);
         const client = entry?.client;
         if (!client) return;
+
+        if (message.type === 'connected') {
+          entry.organizationId = message.organizationId;
+          return;
+        }
 
         if (message.type === 'readFile') {
           const wsDir = join(homedir(), '.openclaw', 'workspace');

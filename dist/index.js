@@ -3,6 +3,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { createAccountListHelpers } from 'openclaw/plugin-sdk/account-helpers';
 import { buildDirectImageSource, extractHtmlImageSources, resolveImageAttachmentConfig, resolveImageAttachments, } from './media.js';
+import { parseOutboundMediaMessage, uploadChatAttachment } from './outbound.js';
 import { NextCompanyWebSocketClient } from './websocket.js';
 const CHANNEL_ID = 'nextcompany';
 const CHANNEL_LABEL = 'NextCompany';
@@ -583,6 +584,7 @@ function buildMessageContext(message, baseUrl) {
         timestamp: toTimestamp(message.timestamp),
         messageSid: message.messageId,
         replyToId: message.messageId,
+        channelId: message.channelId,
         senderName,
         senderId,
         senderUsername: message.from,
@@ -843,6 +845,7 @@ async function resolveInboundContext(message, account) {
 }
 async function dispatchInboundContext(params) {
     const { cfg, accountId, account, inbound, channelRuntime, client } = params;
+    inbound.organizationId ??= connections.get(accountId)?.organizationId;
     const route = channelRuntime.routing.resolveAgentRoute({
         cfg,
         channel: CHANNEL_ID,
@@ -969,6 +972,7 @@ async function dispatchInboundContext(params) {
         MessageSidFull: inbound.messageSid,
         ReplyToId: inbound.replyToId,
         ReplyToIdFull: inbound.replyToId,
+        ChannelId: inbound.channelId,
         Provider: CHANNEL_ID,
         Surface: CHANNEL_ID,
         OriginatingChannel: CHANNEL_ID,
@@ -1001,6 +1005,27 @@ async function dispatchInboundContext(params) {
                 if (!text.trim())
                     return;
                 try {
+                    const parsedMedia = parseOutboundMediaMessage(text);
+                    if (parsedMedia.files.length > 0) {
+                        const channelId = typeof payload === 'string'
+                            ? inbound.channelId
+                            : payload.channelId ?? inbound.channelId;
+                        const organizationId = inbound.organizationId;
+                        if (!channelId)
+                            throw new Error('Cannot send outbound media without a NextCompany chat channelId.');
+                        if (!organizationId)
+                            throw new Error('Cannot send outbound media without a NextCompany organizationId.');
+                        for (const [index, file] of parsedMedia.files.entries()) {
+                            await uploadChatAttachment({
+                                account,
+                                organizationId,
+                                channelId,
+                                file,
+                                text: index === 0 ? parsedMedia.text : undefined,
+                            });
+                        }
+                        return;
+                    }
                     if (inbound.workItem && normalizeToken(inbound.workItem.sourceType) === 'card') {
                         await persistCardReply({
                             account,
@@ -1054,6 +1079,7 @@ async function dispatchInboundContext(params) {
                         type: 'message',
                         text,
                         replyToMessageId: inbound.replyToId,
+                        channelId: inbound.channelId,
                     });
                 }
                 catch (error) {
@@ -1122,6 +1148,10 @@ const channelPlugin = {
                 const client = entry?.client;
                 if (!client)
                     return;
+                if (message.type === 'connected') {
+                    entry.organizationId = message.organizationId;
+                    return;
+                }
                 if (message.type === 'readFile') {
                     const wsDir = join(homedir(), '.openclaw', 'workspace');
                     const filePath = join(wsDir, message.file);

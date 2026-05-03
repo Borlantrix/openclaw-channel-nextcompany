@@ -18,6 +18,7 @@ This OpenClaw channel plugin enables AI agents to connect to [NextCompany](https
 ✅ **Automatic reconnection** with exponential backoff  
 ✅ **Structured inbound routing** — notification payloads are parsed into work-item context  
 ✅ **Inline image attachments** — same-origin comment/chat images are downloaded and delivered as base64 OpenClaw attachments
+✅ **Outbound chat file attachments** — agent replies with `MEDIA:/path/to/file` are uploaded into NextCompany Chat
 ✅ **Entity-based sessions** — cards, posts, tasks, check-ins, and mailbox threads keep stable identities  
 ✅ **Prompt-safe inbound context** — no curl instructions, API keys, or transport meta in agent text  
 ✅ **Single gateway path** — one maintained plugin entrypoint for inbound handling and outbound delivery  
