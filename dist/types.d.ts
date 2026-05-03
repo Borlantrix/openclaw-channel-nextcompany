@@ -170,7 +170,11 @@ export interface NextCompanyAgentInboxEvent {
 export interface NextCompanyAgentWorkItemPayload {
     kind?: string;
     cardId?: string;
+    repositorySlug?: string | null;
+    baseBranch?: string | null;
+    branchPrefix?: string | null;
     title?: string | null;
+    bodyTemplate?: string | null;
     notificationKind?: string;
     sourceTitle?: string;
     excerpt?: string | null;

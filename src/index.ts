@@ -440,6 +440,93 @@ function collectNotificationHtmlBodies(message: NextCompanyNotificationMessage):
   return [{ html, sourceKind: `${normalizeToken(sourceType)}_${normalizeToken(kind)}_inline` }];
 }
 
+
+interface NextCompanyCardDetail {
+  id: string;
+  title?: string | null;
+  description?: string | null;
+  columnId?: string | null;
+  columnName?: string | null;
+  dueDate?: string | null;
+}
+
+function decodeBasicHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function htmlToReadableText(html: string | null | undefined): string | undefined {
+  if (!html?.trim()) return undefined;
+  const text = decodeBasicHtmlEntities(html
+    .replace(/<\/(p|div|li|h[1-6]|blockquote)>/gi, '\n')
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '- ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join('\n'));
+  return text.trim() ? text : undefined;
+}
+
+async function fetchCardDetailForWorkItem(params: {
+  account: NextCompanyAccountConfig;
+  workItem: NextCompanyAgentWorkItem;
+}): Promise<NextCompanyCardDetail | undefined> {
+  if (normalizeToken(params.workItem.sourceType) !== 'card') return undefined;
+  const tableId = workItemPayloadString(params.workItem.payload, 'tableId');
+  const cardId = params.workItem.sourceId;
+  if (!params.workItem.projectId || !tableId || !cardId) return undefined;
+
+  try {
+    return await nextCompanyApiRequest<NextCompanyCardDetail>({
+      account: params.account,
+      path: `/api/projects/${params.workItem.projectId}/card-tables/${tableId}/cards/${cardId}`,
+    });
+  } catch (error) {
+    console.error('[NC] failed to fetch card detail for work item', {
+      workItemId: params.workItem.id,
+      cardId,
+      err: error,
+    });
+    return undefined;
+  }
+}
+
+async function enrichCardWorkItemContext(params: {
+  account: NextCompanyAccountConfig;
+  inbound: RoutedInboundContext;
+  workItem: NextCompanyAgentWorkItem;
+}): Promise<void> {
+  const card = await fetchCardDetailForWorkItem({ account: params.account, workItem: params.workItem });
+  if (!card) return;
+
+  const descriptionText = htmlToReadableText(card.description);
+  const lines = joinContextLines([
+    card.title?.trim() ? `Card title: ${card.title.trim()}` : undefined,
+    card.columnName?.trim() ? `Column: ${card.columnName.trim()}` : undefined,
+    !card.columnName?.trim() && card.columnId?.trim() ? `Column id: ${card.columnId.trim()}` : undefined,
+    card.dueDate?.trim() ? `Due date: ${card.dueDate.trim()}` : undefined,
+    descriptionText ? `Card description:\n${descriptionText}` : undefined,
+  ]);
+  if (lines.length > 0) {
+    params.inbound.rawBody = joinContextLines([params.inbound.rawBody, lines.join('\n')]).join('\n\n');
+  }
+
+  if (card.description?.trim()) {
+    params.inbound.htmlBodies = [
+      ...(params.inbound.htmlBodies ?? []),
+      { html: card.description, sourceKind: 'card_description_inline' },
+    ];
+  }
+}
+
 function notificationField<T = string>(message: NextCompanyNotificationMessage, camel: keyof NextCompanyNotificationMessage, pascal?: keyof NextCompanyNotificationMessage): T | undefined {
   return (message[camel] as T | undefined)
     ?? (pascal ? (message[pascal] as T | undefined) : undefined);
@@ -572,6 +659,10 @@ function buildWorkItemSummary(workItem: NextCompanyAgentWorkItem): string {
   const actor = workItemPayloadField(workItem.payload, 'actorName')?.trim();
   const triggerKind = normalizeLabel(workItem.triggerKind, 'Notification');
 
+  if (normalizeToken(triggerKind) === 'execute_github_pr') {
+    return `Execute GitHub PR work item for ${sourceType} "${title}".`;
+  }
+
   switch (triggerKind) {
     case 'Assigned':
       return actor
@@ -596,11 +687,41 @@ function buildWorkItemSummary(workItem: NextCompanyAgentWorkItem): string {
   }
 }
 
+function buildExecutionWorkItemBody(workItem: NextCompanyAgentWorkItem): string | undefined {
+  const payload = workItem.payload;
+  if (normalizeToken(workItem.triggerKind) !== 'execute_github_pr') return undefined;
+
+  const repositorySlug = workItemPayloadString(payload, 'repositorySlug');
+  const baseBranch = workItemPayloadString(payload, 'baseBranch') ?? 'main';
+  const branchPrefix = workItemPayloadString(payload, 'branchPrefix');
+  const bodyTemplate = workItemPayloadString(payload, 'bodyTemplate');
+  const title = normalizeLabel(workItemPayloadField(payload, 'sourceTitle') ?? workItemPayloadField(payload, 'title') ?? undefined, 'Untitled');
+  const excerpt = workItemPayloadString(payload, 'excerpt');
+
+  return joinContextLines([
+    'Execution request: create a GitHub PR for this NextCompany card.',
+    repositorySlug ? `Repository slug: ${repositorySlug}` : undefined,
+    `Card id: ${workItem.sourceId}`,
+    `Card title: ${title}`,
+    `Base branch: ${baseBranch}`,
+    branchPrefix ? `Branch prefix: ${branchPrefix}` : undefined,
+    excerpt ? `Card excerpt:\n${excerpt}` : undefined,
+    bodyTemplate ? `PR body template:\n${bodyTemplate}` : undefined,
+    '',
+    'Execution requirements:',
+    '- Use the OpenClaw runtime/coding tools, not this channel plugin, to inspect the repository and make changes.',
+    '- Create a branch from the requested base branch.',
+    '- Implement the requested change, run focused validation, commit, push, and open a GitHub PR.',
+    '- Reply with the PR URL, branch, validation performed, and any blockers.',
+  ]).join('\n');
+}
+
 function buildWorkItemContext(workItem: NextCompanyAgentWorkItem, account: NextCompanyAccountConfig): RoutedInboundContext {
   const payload = workItem.payload;
   const sourceTitle = workItemPayloadField(payload, 'sourceTitle');
   const actorName = workItemPayloadField(payload, 'actorName');
   const excerpt = workItemPayloadField(payload, 'excerpt');
+  const executionBody = buildExecutionWorkItemBody(workItem);
   const entityType = normalizeToken(workItemPayloadField(payload, 'entityKind') ?? workItem.sourceType, 'notification');
   const entityId = normalizeToken(workItemPayloadField(payload, 'entityId') ?? workItem.sourceId ?? workItem.id, 'unknown');
   const projectId = normalizeToken(workItem.projectId, 'project');
@@ -608,7 +729,8 @@ function buildWorkItemContext(workItem: NextCompanyAgentWorkItem, account: NextC
   const peerId = `${entityType}:${projectId}:${entityId}`;
   const rawBody = [
     buildWorkItemSummary(workItem),
-    excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
+    executionBody,
+    !executionBody && excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join('\n\n');
@@ -639,6 +761,9 @@ function buildWorkItemContext(workItem: NextCompanyAgentWorkItem, account: NextC
       workItem.correlationKey ? `Correlation key: ${workItem.correlationKey}` : undefined,
       workItem.sessionKey ? `Existing session key: ${workItem.sessionKey}` : undefined,
       workItemPayloadField(payload, 'tableId') ? `Table id: ${workItemPayloadField(payload, 'tableId')}` : undefined,
+      workItemPayloadString(payload, 'repositorySlug') ? `Repository slug: ${workItemPayloadString(payload, 'repositorySlug')}` : undefined,
+      workItemPayloadString(payload, 'baseBranch') ? `Base branch: ${workItemPayloadString(payload, 'baseBranch')}` : undefined,
+      workItemPayloadString(payload, 'branchPrefix') ? `Branch prefix: ${workItemPayloadString(payload, 'branchPrefix')}` : undefined,
       workItemPayloadField(payload, 'threadId') ? `Thread id: ${workItemPayloadField(payload, 'threadId')}` : undefined,
       workItemPayloadField(payload, 'conversationId') ? `Conversation id: ${workItemPayloadField(payload, 'conversationId')}` : undefined,
       workItemPayloadField(payload, 'mailboxId') ? `Mailbox id: ${workItemPayloadField(payload, 'mailboxId')}` : undefined,
@@ -1020,6 +1145,7 @@ async function resolveInboundContext(message: InboundMessage, account: NextCompa
 
     const workItem = await fetchAgentWorkItem(account, referencedWorkItemId);
     const inbound = buildWorkItemContext(workItem, account);
+    await enrichCardWorkItemContext({ account, inbound, workItem });
     if (!inbound.htmlBodies?.length) {
       const fetchedHtml = await fetchSourceHtml({
         account,
