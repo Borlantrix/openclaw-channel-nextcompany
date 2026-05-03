@@ -433,6 +433,9 @@ function buildWorkItemSummary(workItem) {
     const sourceType = normalizeLabel(workItem.sourceType, 'work item');
     const actor = workItemPayloadField(workItem.payload, 'actorName')?.trim();
     const triggerKind = normalizeLabel(workItem.triggerKind, 'Notification');
+    if (normalizeToken(triggerKind) === 'execute_github_pr') {
+        return `Execute GitHub PR work item for ${sourceType} "${title}".`;
+    }
     switch (triggerKind) {
         case 'Assigned':
             return actor
@@ -456,11 +459,39 @@ function buildWorkItemSummary(workItem) {
                 : `${triggerKind} on ${sourceType} "${title}".`;
     }
 }
+function buildExecutionWorkItemBody(workItem) {
+    const payload = workItem.payload;
+    if (normalizeToken(workItem.triggerKind) !== 'execute_github_pr')
+        return undefined;
+    const repositorySlug = workItemPayloadString(payload, 'repositorySlug');
+    const baseBranch = workItemPayloadString(payload, 'baseBranch') ?? 'main';
+    const branchPrefix = workItemPayloadString(payload, 'branchPrefix');
+    const bodyTemplate = workItemPayloadString(payload, 'bodyTemplate');
+    const title = normalizeLabel(workItemPayloadField(payload, 'sourceTitle') ?? workItemPayloadField(payload, 'title') ?? undefined, 'Untitled');
+    const excerpt = workItemPayloadString(payload, 'excerpt');
+    return joinContextLines([
+        'Execution request: create a GitHub PR for this NextCompany card.',
+        repositorySlug ? `Repository slug: ${repositorySlug}` : undefined,
+        `Card id: ${workItem.sourceId}`,
+        `Card title: ${title}`,
+        `Base branch: ${baseBranch}`,
+        branchPrefix ? `Branch prefix: ${branchPrefix}` : undefined,
+        excerpt ? `Card excerpt:\n${excerpt}` : undefined,
+        bodyTemplate ? `PR body template:\n${bodyTemplate}` : undefined,
+        '',
+        'Execution requirements:',
+        '- Use the OpenClaw runtime/coding tools, not this channel plugin, to inspect the repository and make changes.',
+        '- Create a branch from the requested base branch.',
+        '- Implement the requested change, run focused validation, commit, push, and open a GitHub PR.',
+        '- Reply with the PR URL, branch, validation performed, and any blockers.',
+    ]).join('\n');
+}
 function buildWorkItemContext(workItem, account) {
     const payload = workItem.payload;
     const sourceTitle = workItemPayloadField(payload, 'sourceTitle');
     const actorName = workItemPayloadField(payload, 'actorName');
     const excerpt = workItemPayloadField(payload, 'excerpt');
+    const executionBody = buildExecutionWorkItemBody(workItem);
     const entityType = normalizeToken(workItemPayloadField(payload, 'entityKind') ?? workItem.sourceType, 'notification');
     const entityId = normalizeToken(workItemPayloadField(payload, 'entityId') ?? workItem.sourceId ?? workItem.id, 'unknown');
     const projectId = normalizeToken(workItem.projectId, 'project');
@@ -468,7 +499,8 @@ function buildWorkItemContext(workItem, account) {
     const peerId = `${entityType}:${projectId}:${entityId}`;
     const rawBody = [
         buildWorkItemSummary(workItem),
-        excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
+        executionBody,
+        !executionBody && excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
     ]
         .filter((line) => Boolean(line))
         .join('\n\n');
@@ -498,6 +530,9 @@ function buildWorkItemContext(workItem, account) {
             workItem.correlationKey ? `Correlation key: ${workItem.correlationKey}` : undefined,
             workItem.sessionKey ? `Existing session key: ${workItem.sessionKey}` : undefined,
             workItemPayloadField(payload, 'tableId') ? `Table id: ${workItemPayloadField(payload, 'tableId')}` : undefined,
+            workItemPayloadString(payload, 'repositorySlug') ? `Repository slug: ${workItemPayloadString(payload, 'repositorySlug')}` : undefined,
+            workItemPayloadString(payload, 'baseBranch') ? `Base branch: ${workItemPayloadString(payload, 'baseBranch')}` : undefined,
+            workItemPayloadString(payload, 'branchPrefix') ? `Branch prefix: ${workItemPayloadString(payload, 'branchPrefix')}` : undefined,
             workItemPayloadField(payload, 'threadId') ? `Thread id: ${workItemPayloadField(payload, 'threadId')}` : undefined,
             workItemPayloadField(payload, 'conversationId') ? `Conversation id: ${workItemPayloadField(payload, 'conversationId')}` : undefined,
             workItemPayloadField(payload, 'mailboxId') ? `Mailbox id: ${workItemPayloadField(payload, 'mailboxId')}` : undefined,
