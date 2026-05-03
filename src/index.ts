@@ -440,6 +440,93 @@ function collectNotificationHtmlBodies(message: NextCompanyNotificationMessage):
   return [{ html, sourceKind: `${normalizeToken(sourceType)}_${normalizeToken(kind)}_inline` }];
 }
 
+
+interface NextCompanyCardDetail {
+  id: string;
+  title?: string | null;
+  description?: string | null;
+  columnId?: string | null;
+  columnName?: string | null;
+  dueDate?: string | null;
+}
+
+function decodeBasicHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function htmlToReadableText(html: string | null | undefined): string | undefined {
+  if (!html?.trim()) return undefined;
+  const text = decodeBasicHtmlEntities(html
+    .replace(/<\/(p|div|li|h[1-6]|blockquote)>/gi, '\n')
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '- ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join('\n'));
+  return text.trim() ? text : undefined;
+}
+
+async function fetchCardDetailForWorkItem(params: {
+  account: NextCompanyAccountConfig;
+  workItem: NextCompanyAgentWorkItem;
+}): Promise<NextCompanyCardDetail | undefined> {
+  if (normalizeToken(params.workItem.sourceType) !== 'card') return undefined;
+  const tableId = workItemPayloadString(params.workItem.payload, 'tableId');
+  const cardId = params.workItem.sourceId;
+  if (!params.workItem.projectId || !tableId || !cardId) return undefined;
+
+  try {
+    return await nextCompanyApiRequest<NextCompanyCardDetail>({
+      account: params.account,
+      path: `/api/projects/${params.workItem.projectId}/card-tables/${tableId}/cards/${cardId}`,
+    });
+  } catch (error) {
+    console.error('[NC] failed to fetch card detail for work item', {
+      workItemId: params.workItem.id,
+      cardId,
+      err: error,
+    });
+    return undefined;
+  }
+}
+
+async function enrichCardWorkItemContext(params: {
+  account: NextCompanyAccountConfig;
+  inbound: RoutedInboundContext;
+  workItem: NextCompanyAgentWorkItem;
+}): Promise<void> {
+  const card = await fetchCardDetailForWorkItem({ account: params.account, workItem: params.workItem });
+  if (!card) return;
+
+  const descriptionText = htmlToReadableText(card.description);
+  const lines = joinContextLines([
+    card.title?.trim() ? `Card title: ${card.title.trim()}` : undefined,
+    card.columnName?.trim() ? `Column: ${card.columnName.trim()}` : undefined,
+    !card.columnName?.trim() && card.columnId?.trim() ? `Column id: ${card.columnId.trim()}` : undefined,
+    card.dueDate?.trim() ? `Due date: ${card.dueDate.trim()}` : undefined,
+    descriptionText ? `Card description:\n${descriptionText}` : undefined,
+  ]);
+  if (lines.length > 0) {
+    params.inbound.rawBody = joinContextLines([params.inbound.rawBody, lines.join('\n')]).join('\n\n');
+  }
+
+  if (card.description?.trim()) {
+    params.inbound.htmlBodies = [
+      ...(params.inbound.htmlBodies ?? []),
+      { html: card.description, sourceKind: 'card_description_inline' },
+    ];
+  }
+}
+
 function notificationField<T = string>(message: NextCompanyNotificationMessage, camel: keyof NextCompanyNotificationMessage, pascal?: keyof NextCompanyNotificationMessage): T | undefined {
   return (message[camel] as T | undefined)
     ?? (pascal ? (message[pascal] as T | undefined) : undefined);
@@ -1058,6 +1145,7 @@ async function resolveInboundContext(message: InboundMessage, account: NextCompa
 
     const workItem = await fetchAgentWorkItem(account, referencedWorkItemId);
     const inbound = buildWorkItemContext(workItem, account);
+    await enrichCardWorkItemContext({ account, inbound, workItem });
     if (!inbound.htmlBodies?.length) {
       const fetchedHtml = await fetchSourceHtml({
         account,
