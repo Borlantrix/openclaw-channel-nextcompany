@@ -1,4 +1,3 @@
-import { execSync, spawn } from 'child_process';
 import { existsSync, readdirSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -37,22 +36,6 @@ function resolveAccount(cfg, accountId) {
     const accounts = getAccounts(cfg);
     const id = accountId ?? resolveDefaultAccountId(cfg);
     return accounts[id] ?? { id: id ?? 'default', apiKey: '', url: '' };
-}
-function getOpenClawVersion() {
-    try {
-        return execSync('openclaw --version 2>/dev/null', { timeout: 5000 }).toString().trim();
-    }
-    catch {
-        return undefined;
-    }
-}
-function getLatestOpenClawVersion() {
-    try {
-        return execSync('npm view openclaw version 2>/dev/null', { timeout: 10000 }).toString().trim();
-    }
-    catch {
-        return undefined;
-    }
 }
 function getWorkspaceFiles() {
     const wsDir = join(homedir(), '.openclaw', 'workspace');
@@ -99,8 +82,6 @@ function extractField(content, field) {
     return match?.[1]?.trim();
 }
 function buildIdentifyPayload(cfg) {
-    const version = getOpenClawVersion();
-    const latestVersion = getLatestOpenClawVersion();
     const workspaceFiles = getWorkspaceFiles();
     const wsDir = join(homedir(), '.openclaw', 'workspace');
     let email;
@@ -159,8 +140,6 @@ function buildIdentifyPayload(cfg) {
         activeModel = undefined;
     }
     return {
-        version,
-        latestVersion,
         workspaceFiles,
         email,
         gitHubUsername,
@@ -187,98 +166,6 @@ function serializeTransitionBody(body) {
         occurredAt: body.occurredAt,
     }).filter(([, value]) => value !== undefined));
     return Object.keys(payload).length > 0 ? JSON.stringify(payload) : undefined;
-}
-function getGithubPrExecutorConfig(cfg) {
-    const pluginConfig = getPluginConfig(cfg);
-    const raw = pluginConfig['githubPrExecutor'];
-    const repoMapRaw = raw?.['repoMap'];
-    const repoMap = repoMapRaw
-        ? Object.fromEntries(Object.entries(repoMapRaw).map(([key, value]) => [key, String(value)]))
-        : undefined;
-    return {
-        enabled: raw?.['enabled'] === undefined ? true : Boolean(raw['enabled']),
-        mode: raw?.['mode'] === 'command' ? 'command' : 'codex',
-        command: raw?.['command'] ? String(raw['command']) : undefined,
-        args: Array.isArray(raw?.['args']) ? raw?.['args'].map((v) => String(v)) : undefined,
-        timeoutMs: typeof raw?.['timeoutMs'] === 'number' ? raw['timeoutMs'] : 20 * 60_000,
-        repoMap,
-    };
-}
-function resolveRepoPath(repoSlug, cfg) {
-    const executor = getGithubPrExecutorConfig(cfg);
-    const mapped = executor.repoMap?.[repoSlug];
-    if (mapped)
-        return mapped;
-    const repoName = repoSlug.split('/').pop() ?? repoSlug;
-    return join(homedir(), '.openclaw', 'workspace', 'repos', repoName);
-}
-function commandExists(command) {
-    try {
-        execSync(`command -v ${command} >/dev/null 2>&1`, { timeout: 5000 });
-        return true;
-    }
-    catch {
-        return false;
-    }
-}
-function parseJsonObject(text) {
-    const trimmed = text.trim();
-    if (!trimmed)
-        throw new Error('Executor returned empty output.');
-    try {
-        return JSON.parse(trimmed);
-    }
-    catch {
-        const match = trimmed.match(/\{[\s\S]*\}/);
-        if (!match)
-            throw new Error(`Executor output is not valid JSON: ${trimmed.slice(0, 500)}`);
-        return JSON.parse(match[0]);
-    }
-}
-async function runProcessJson(params) {
-    return await new Promise((resolve, reject) => {
-        const child = spawn(params.command, params.args, {
-            cwd: params.cwd,
-            env: process.env,
-            stdio: ['pipe', 'pipe', 'pipe'],
-        });
-        let stdout = '';
-        let stderr = '';
-        let timedOut = false;
-        const timeout = setTimeout(() => {
-            timedOut = true;
-            child.kill('SIGKILL');
-        }, params.timeoutMs);
-        child.stdout.on('data', (chunk) => {
-            stdout += chunk.toString();
-        });
-        child.stderr.on('data', (chunk) => {
-            stderr += chunk.toString();
-        });
-        child.on('error', (error) => {
-            clearTimeout(timeout);
-            reject(error);
-        });
-        child.on('close', (code) => {
-            clearTimeout(timeout);
-            if (timedOut) {
-                reject(new Error(`Executor timed out after ${params.timeoutMs}ms.`));
-                return;
-            }
-            if (code !== 0) {
-                reject(new Error(`Executor exited with code ${code}. ${stderr || stdout}`.trim()));
-                return;
-            }
-            try {
-                resolve(parseJsonObject(stdout));
-            }
-            catch (error) {
-                reject(error);
-            }
-        });
-        child.stdin.write(params.input);
-        child.stdin.end();
-    });
 }
 async function nextCompanyApiRequest(params) {
     const response = await fetch(buildNextCompanyApiUrl(params.account, params.path), {
@@ -903,112 +790,6 @@ async function persistTaskReplyAndComplete(params) {
     });
     return taskRoute;
 }
-async function fetchExecutionContext(account, cardId) {
-    try {
-        return await nextCompanyApiRequest({
-            account,
-            path: `/api/agents/me/execution-context?cardId=${encodeURIComponent(cardId)}`,
-        });
-    }
-    catch {
-        return undefined;
-    }
-}
-function buildCodexGithubPrPrompt(params) {
-    const payload = params.workItem.payload ?? {};
-    const card = params.executionContext?.['card'];
-    const currentStage = params.executionContext?.['currentStage'];
-    const board = params.executionContext?.['board'];
-    const cardTitle = String(card?.['title'] ?? payload.title ?? 'Untitled');
-    const cardDescription = typeof card?.['description'] === 'string' ? card['description'] : '';
-    const stageInstructions = typeof currentStage?.['agentInstructions'] === 'string' ? currentStage['agentInstructions'] : '';
-    const boardPrompt = typeof board?.['agentPrompt'] === 'string' ? board['agentPrompt'] : '';
-    return [
-        'You are executing a NextCompany github_pr work item.',
-        `Repository slug: ${payload.repositorySlug ?? 'unknown'}`,
-        `Local repository path: ${params.repoPath}`,
-        `Card id: ${payload.cardId ?? params.workItem.sourceId}`,
-        `Card title: ${cardTitle}`,
-        cardDescription ? `Card description:\n${cardDescription}` : undefined,
-        `Base branch: ${String(payload.baseBranch ?? 'main')}`,
-        payload.branchPrefix ? `Branch prefix: ${payload.branchPrefix}` : undefined,
-        payload.bodyTemplate ? `PR body template:\n${payload.bodyTemplate}` : undefined,
-        boardPrompt ? `Board prompt:\n${boardPrompt}` : undefined,
-        stageInstructions ? `Stage instructions:\n${stageInstructions}` : undefined,
-        '',
-        'Requirements:',
-        '- Make the requested change in the local repository.',
-        '- Use git and gh to create a real GitHub PR against the base branch.',
-        '- Run focused validation when relevant.',
-        '- Commit and push your branch.',
-        '- Output ONLY a single JSON object and no markdown.',
-        '- On success output: {"prUrl":"...","prNumber":123,"branchName":"...","changedFilesCount":4}',
-        '- On failure output: {"error":"clear reason"}',
-    ].filter(Boolean).join('\n');
-}
-async function executeGithubPrWorkItem(params) {
-    const workItem = params.inbound.workItem;
-    if (!workItem)
-        throw new Error('Missing work item context for github_pr execution.');
-    const payload = workItem.payload ?? {};
-    const repoSlug = payload.repositorySlug;
-    if (!repoSlug)
-        throw new Error('github_pr payload is missing repositorySlug.');
-    const repoPath = resolveRepoPath(repoSlug, params.cfg);
-    if (!existsSync(repoPath))
-        throw new Error(`Local repository path not found for ${repoSlug}: ${repoPath}`);
-    const executor = getGithubPrExecutorConfig(params.cfg);
-    if (executor.enabled === false) {
-        throw new Error('github_pr executor is disabled in plugin configuration.');
-    }
-    const executionContext = payload.cardId ? await fetchExecutionContext(params.account, payload.cardId) : undefined;
-    let rawResult;
-    if (executor.mode === 'command' && executor.command) {
-        rawResult = await runProcessJson({
-            command: executor.command,
-            args: executor.args ?? [],
-            cwd: repoPath,
-            timeoutMs: executor.timeoutMs ?? 20 * 60_000,
-            input: JSON.stringify({
-                workItem,
-                sessionKey: params.sessionKey,
-                repoPath,
-                executionContext,
-            }),
-        });
-    }
-    else {
-        if (!commandExists('codex')) {
-            throw new Error('github_pr executor is not configured and Codex CLI is unavailable.');
-        }
-        rawResult = await runProcessJson({
-            command: 'codex',
-            args: ['exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', buildCodexGithubPrPrompt({
-                    workItem,
-                    repoPath,
-                    executionContext,
-                })],
-            cwd: repoPath,
-            timeoutMs: executor.timeoutMs ?? 20 * 60_000,
-            input: '',
-        });
-    }
-    if (typeof rawResult['error'] === 'string' && rawResult['error'].trim()) {
-        throw new Error(String(rawResult['error']).trim());
-    }
-    const prUrl = rawResult['prUrl'];
-    const prNumber = rawResult['prNumber'];
-    if (typeof prUrl !== 'string' || !prUrl.trim())
-        throw new Error('Executor did not return prUrl.');
-    if (typeof prNumber !== 'number' || prNumber <= 0)
-        throw new Error('Executor did not return a valid prNumber.');
-    return {
-        prUrl: prUrl.trim(),
-        prNumber,
-        branchName: typeof rawResult['branchName'] === 'string' ? rawResult['branchName'] : undefined,
-        changedFilesCount: typeof rawResult['changedFilesCount'] === 'number' ? rawResult['changedFilesCount'] : undefined,
-    };
-}
 async function resolveInboundContext(message, account) {
     const baseUrl = normalizeBaseUrl(account.url);
     const referencedWorkItemId = (message.type === 'agent_wake' || message.type === 'notification') ? resolveReferencedWorkItemId(message) : undefined;
@@ -1168,49 +949,6 @@ async function dispatchInboundContext(params) {
                 }),
             },
         });
-        if (inbound.workItem?.triggerKind === 'execute_github_pr') {
-            try {
-                const result = await executeGithubPrWorkItem({
-                    cfg,
-                    account,
-                    inbound,
-                    sessionKey: resolvedSessionKey,
-                });
-                await transitionAgentWorkItem({
-                    account,
-                    workItemId: inbound.workItemId,
-                    action: 'complete',
-                    body: {
-                        sessionKey: resolvedSessionKey,
-                        metadataJson: JSON.stringify({
-                            transport: 'openclaw-plugin',
-                            state: 'executor-completed',
-                            prUrl: result.prUrl,
-                            prNumber: result.prNumber,
-                            branchName: result.branchName,
-                            changedFilesCount: result.changedFilesCount,
-                        }),
-                    },
-                });
-            }
-            catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                await transitionAgentWorkItem({
-                    account,
-                    workItemId: inbound.workItemId,
-                    action: 'fail',
-                    body: {
-                        sessionKey: resolvedSessionKey,
-                        error: message,
-                        metadataJson: JSON.stringify({
-                            transport: 'openclaw-plugin',
-                            state: 'executor-failed',
-                        }),
-                    },
-                });
-            }
-            return;
-        }
     }
     const ctxPayload = channelRuntime.reply.finalizeInboundContext({
         Body: body,
