@@ -687,6 +687,33 @@ function buildWorkItemSummary(workItem: NextCompanyAgentWorkItem): string {
   }
 }
 
+function buildFocusAnalysisWorkItemBody(workItem: NextCompanyAgentWorkItem): string | undefined {
+  if (normalizeToken(workItem.triggerKind) !== 'focus_analysis' && normalizeToken(workItem.sourceType) !== 'focusentry') return undefined;
+
+  const excerpt = workItemPayloadString(workItem.payload, 'excerpt');
+  return joinContextLines([
+    'Focus analysis request: analyze this Focus entry using the configured agent. Do not use local keyword heuristics.',
+    excerpt ? `Focus payload:\n${excerpt}` : undefined,
+    '',
+    'Reply with only valid JSON. No prose, no markdown fences.',
+    'Expected JSON shape:',
+    JSON.stringify({
+      focusAnalysis: {
+        type: 'Decision | Risk | Opportunity | Blocker | FollowUp | MentalEnergy',
+        mentalWeight: 'Low | Medium | High',
+        mentalState: 'Confusion | Avoidance | Clear | Anxiety',
+        nextMove: 'Decide | Delegate | PromoteToCard | Ignore | ReviewLater',
+        reviewTiming: 'Today | ThisWeek | Later',
+        projectId: 'optional project id from availableProjects, or null',
+        projectName: 'optional suggested project name, or null',
+        rationale: 'short explanation',
+        confidence: 0.75,
+        promoteToCard: true,
+      },
+    }, null, 2),
+  ]).join('\n');
+}
+
 function buildExecutionWorkItemBody(workItem: NextCompanyAgentWorkItem): string | undefined {
   const payload = workItem.payload;
   if (normalizeToken(workItem.triggerKind) !== 'execute_github_pr') return undefined;
@@ -721,6 +748,7 @@ function buildWorkItemContext(workItem: NextCompanyAgentWorkItem, account: NextC
   const sourceTitle = workItemPayloadField(payload, 'sourceTitle');
   const actorName = workItemPayloadField(payload, 'actorName');
   const excerpt = workItemPayloadField(payload, 'excerpt');
+  const focusAnalysisBody = buildFocusAnalysisWorkItemBody(workItem);
   const executionBody = buildExecutionWorkItemBody(workItem);
   const entityType = normalizeToken(workItemPayloadField(payload, 'entityKind') ?? workItem.sourceType, 'notification');
   const entityId = normalizeToken(workItemPayloadField(payload, 'entityId') ?? workItem.sourceId ?? workItem.id, 'unknown');
@@ -729,8 +757,9 @@ function buildWorkItemContext(workItem: NextCompanyAgentWorkItem, account: NextC
   const peerId = `${entityType}:${projectId}:${entityId}`;
   const rawBody = [
     buildWorkItemSummary(workItem),
-    executionBody,
-    !executionBody && excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
+    focusAnalysisBody,
+    !focusAnalysisBody ? executionBody : undefined,
+    !focusAnalysisBody && !executionBody && excerpt?.trim() ? `Excerpt:\n${excerpt.trim()}` : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join('\n\n');
@@ -954,6 +983,30 @@ async function transitionAgentWorkItem(params: {
     method: 'POST',
     body: serializeTransitionBody(params.body ?? {}),
   });
+}
+
+function extractFocusAnalysisMetadataJson(text: string): string {
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  const candidate = fenced?.[1]?.trim() ?? trimmed;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    const objectMatch = /\{[\s\S]*\}/.exec(candidate);
+    if (!objectMatch) throw new Error('Focus analysis reply did not contain a JSON object.');
+    parsed = JSON.parse(objectMatch[0]);
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Focus analysis reply JSON must be an object.');
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const metadata = record.focusAnalysis || record.analysis
+    ? record
+    : { focusAnalysis: record };
+  return JSON.stringify(metadata);
 }
 
 interface NextCompanyProjectTask {
@@ -1378,6 +1431,21 @@ async function dispatchInboundContext(params: {
                 text: index === 0 ? parsedMedia.text : undefined,
               });
             }
+            return;
+          }
+
+          if (inbound.workItem && normalizeToken(inbound.workItem.sourceType) === 'focusentry') {
+            if (!inbound.workItemId) return;
+            const metadataJson = extractFocusAnalysisMetadataJson(text);
+            await transitionAgentWorkItem({
+              account,
+              workItemId: inbound.workItemId,
+              action: 'complete',
+              body: {
+                sessionKey: resolvedSessionKey,
+                metadataJson,
+              },
+            });
             return;
           }
 
