@@ -551,6 +551,9 @@ function buildExecutionWorkItemBody(workItem) {
         '- Use the OpenClaw runtime/coding tools, not this channel plugin, to inspect the repository and make changes.',
         '- Create a branch from the requested base branch.',
         '- Implement the requested change, run focused validation, commit, push, and open a GitHub PR.',
+        '- After opening the PR, immediately check whether it has merge conflicts against the base branch (for example with gh pr view/gh api or by fetching the base branch and merging/rebasing locally).',
+        '- If conflicts exist and can be resolved safely, resolve them in the PR branch right away, rerun focused validation, commit/push the conflict-resolution changes, and re-check that the PR is mergeable.',
+        '- Do not mark the work item complete while the PR is still conflicted unless conflict resolution is genuinely blocked; if blocked, explain exactly which files/conflicts need human input.',
         '- Reply with the PR URL, branch, validation performed, and any blockers.',
     ]).join('\n');
 }
