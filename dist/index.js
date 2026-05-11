@@ -310,6 +310,44 @@ function collectWorkItemHtmlBodies(workItem) {
             sourceKind: `${normalizeToken(workItem.sourceType)}_${normalizeToken(workItem.triggerKind)}_inline`,
         }];
 }
+function extractStructuredJsonObjectText(text) {
+    const trimmed = text.trim();
+    if (!trimmed)
+        return undefined;
+    const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    const candidate = (fenced?.[1] ?? trimmed).trim();
+    const start = candidate.indexOf('{');
+    const end = candidate.lastIndexOf('}');
+    if (start < 0 || end <= start)
+        return undefined;
+    const jsonText = candidate.slice(start, end + 1);
+    try {
+        const parsed = JSON.parse(jsonText);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? JSON.stringify(parsed)
+            : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function buildFocusEntryCompletionMetadata(text, triggerKind) {
+    const structured = extractStructuredJsonObjectText(text);
+    if (structured)
+        return structured;
+    const answer = text.trim();
+    if (!answer) {
+        return JSON.stringify({ focusAnalysis: { rationale: 'O agente concluiu sem devolver conteúdo.' } });
+    }
+    const normalizedTrigger = normalizeToken(triggerKind ?? undefined);
+    if (normalizedTrigger === 'focus_conversation') {
+        return JSON.stringify({ focusConversation: { answer } });
+    }
+    if (normalizedTrigger === 'focus_analysis') {
+        return JSON.stringify({ focusAnalysis: { rationale: answer } });
+    }
+    return JSON.stringify({ response: answer });
+}
 function collectNotificationHtmlBodies(message) {
     const html = notificationField(message, 'htmlBody', 'HtmlBody')
         ?? notificationField(message, 'bodyHtml', 'BodyHtml');
@@ -1129,6 +1167,20 @@ async function dispatchInboundContext(params) {
                                 channelId,
                                 file,
                                 text: index === 0 ? parsedMedia.text : undefined,
+                            });
+                        }
+                        return;
+                    }
+                    if (inbound.workItem && normalizeToken(inbound.workItem.sourceType) === 'focusentry') {
+                        if (inbound.workItemId) {
+                            await transitionAgentWorkItem({
+                                account,
+                                workItemId: inbound.workItemId,
+                                action: 'complete',
+                                body: {
+                                    sessionKey: resolvedSessionKey,
+                                    metadataJson: buildFocusEntryCompletionMetadata(text, inbound.workItem.triggerKind),
+                                },
                             });
                         }
                         return;
